@@ -237,7 +237,7 @@ export async function processJob(env: Env, id: string, run = execute): Promise<v
           rangeConfig = await seal(account, env.ENCRYPTION_KEY, `account:${current.account}`);
           result.message = "签到范围已获取并应用";
         }
-        const secretValues = [account.password, notifyOption(account).rcvOption, account.username];
+        const secretValues = [account.password, notifyOption(account).rcvOption, account.username, account.displayName??""];
         result.message = redact(result.message, secretValues);
         if (result.detail) result.detail = redact(result.detail, secretValues);
       } catch (e) {

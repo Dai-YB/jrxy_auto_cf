@@ -1,4 +1,4 @@
-import { EngineError } from "../types";
+import { EngineError, type RequestDiagnostic, type RequestStage } from "../types";
 import { getDomain } from "tldts";
 
 export const LOGIN_UA = "Mozilla/5.0 (Linux; Android 8.0.0; MI 6 Build/OPR1.170623.027; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/92.0.4515.131 Mobile Safari/537.36 okhttp/3.12.4";
@@ -59,19 +59,31 @@ export class Session {
   readonly jar = new CookieJar();
   private count = 0;
   private deadline: number;
+  private stage: RequestStage = "request";
+  private last?: Omit<RequestDiagnostic,"stage"|"kind">;
   constructor(private transport: typeof fetch = fetch, private timeoutMs = 30_000, runTimeoutMs = 300_000) {
     this.deadline = Date.now() + runTimeoutMs;
   }
+  at(stage: RequestStage): this { this.stage=stage;return this; }
+  diagnostic(kind: RequestDiagnostic["kind"]): RequestDiagnostic { return {...this.last,stage:this.stage,kind}; }
+  private failure(message: string, kind: RequestDiagnostic["kind"], retryable = false): EngineError {
+    return new EngineError(message,retryable?"error":"fail",retryable,this.diagnostic(kind));
+  }
   async request(input: string, options: RequestInit = {}, follow = true): Promise<HttpResult> {
-    let url = publicUrl(input);
+    this.last=undefined;
+    let url: URL;
+    try { url=publicUrl(input); }
+    catch { throw this.failure("仅允许公网 HTTPS 域名，不支持本地代理或校园内网地址","policy"); }
     let method = options.method ?? "GET";
     let body = options.body;
     const headers = new Headers(options.headers);
     if(!headers.has("User-Agent"))headers.set("User-Agent", LOGIN_UA);
     for (let hop = 0; hop <= 10; hop++) {
-      if (++this.count > 40) throw new EngineError("本次任务请求数过多，已停止");
-      const left = this.deadline - Date.now();
-      if (left <= 0) throw new EngineError("任务网络总时限已到", "error", true);
+      const started=Date.now();
+      this.last={host:url.hostname,method:["GET","POST","HEAD"].includes(method)?method as "GET"|"POST"|"HEAD":undefined,elapsedMs:0};
+      if (++this.count > 40) throw this.failure("本次任务请求数过多，已停止","request_limit");
+      const left = this.deadline - started;
+      if (left <= 0) throw this.failure("任务网络总时限已到","total_timeout",true);
       const h = new Headers(headers);
       h.set("Cookie", this.jar.header(url));
       if (options.headers && new Headers(options.headers).has("Cookie") && hop === 0) h.set("Cookie", new Headers(options.headers).get("Cookie")!);
@@ -80,6 +92,7 @@ export class Session {
       let result: HttpResult;
       try {
         const response = await this.transport(url.href, { method, body, headers: h, redirect: "manual", signal: abort.signal });
+        this.last.httpStatus=response.status;
         for (const cookie of response.headers.getSetCookie()) this.jar.set(cookie, url);
         const reader = response.body?.getReader();
         const chunks: Uint8Array[] = [];
@@ -96,29 +109,34 @@ export class Session {
         for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
         result = { status: response.status, url: url.href, headers: response.headers, text: new TextDecoder().decode(bytes) };
       } catch (e) {
-        if (e instanceof EngineError) throw e;
-        throw new EngineError("上游网络请求失败或超时", "error", true);
+        this.last.elapsedMs=Math.max(0,Date.now()-started);
+        if (e instanceof EngineError) { e.diagnostic??=this.diagnostic("response");throw e; }
+        if(abort.signal.aborted)throw this.failure("上游请求超时",left<=this.timeoutMs?"total_timeout":"timeout",true);
+        throw this.failure("上游连接或读取失败（可能涉及DNS、TLS或连接中断，尚不能确定）","transport",true);
       } finally { clearTimeout(timer); }
-      if (result.status === 418 || result.status === 429) throw new EngineError("上游限制访问，请停止自动执行并检查账号/网络");
+      this.last.elapsedMs=Math.max(0,Date.now()-started);
+      if (result.status === 418 || result.status === 429) throw this.failure("上游限制访问，请停止自动执行并检查账号/网络","http");
       if (follow && [301, 302, 303, 307, 308].includes(result.status) && result.headers.has("location")) {
-        const next = publicUrl(new URL(result.headers.get("location")!, url).href);
+        let next: URL;
+        try { next=publicUrl(new URL(result.headers.get("location")!,url).href); }
+        catch { throw this.failure("登录跳转目标不符合公网HTTPS要求","policy"); }
         if ((result.status === 303 && method !== "HEAD") || (result.status === 302 && method !== "HEAD") || (result.status === 301 && method === "POST")) {
           method = "GET"; body = undefined; headers.delete("Content-Type");
-        } else if (next.origin !== url.origin && body) throw new EngineError("拒绝将登录数据重定向到其他域名");
+        } else if (next.origin !== url.origin && body) throw this.failure("拒绝将登录数据重定向到其他域名","policy");
         headers.delete("Cookie"); headers.delete("Authorization");
         url = next;
         continue;
       }
-      if (result.status >= 500) throw new EngineError(`上游服务暂不可用（HTTP ${result.status}）`, "error", true);
+      if (result.status >= 500) throw this.failure(`上游服务暂不可用（HTTP ${result.status}）`,"http",true);
       return result;
     }
-    throw new EngineError("登录重定向次数过多");
+    throw this.failure("登录重定向次数过多","redirect_limit");
   }
   async json<T = any>(url: string, data?: unknown, headers?: HeadersInit): Promise<T> {
     const r = await this.request(url, { method: data === undefined ? "GET" : "POST",
       headers: { "Content-Type": "application/json", ...Object.fromEntries(new Headers(headers)) },
       body: data === undefined ? undefined : JSON.stringify(data) });
-    if (r.status < 200 || r.status >= 300) throw new EngineError(`上游返回 HTTP ${r.status}`);
-    try { return JSON.parse(r.text) as T; } catch { throw new EngineError("上游未返回 JSON，可能登录失效或需要人工验证"); }
+    if (r.status < 200 || r.status >= 300) throw this.failure(`上游返回 HTTP ${r.status}`,"http");
+    try { return JSON.parse(r.text) as T; } catch { throw this.failure("上游未返回 JSON，可能登录失效或需要人工验证","response"); }
   }
 }

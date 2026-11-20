@@ -1,8 +1,8 @@
 import { AppError, type Account, type AccountRow, type Env } from "./types";
 import { seal, unseal } from "./security";
-import { requireDeviceId } from "./engine/device";
+import { initializeDeviceId } from "./engine/device";
 import { notifyOption } from "./notify";
-import { accountValid, identityKey } from "./identity";
+import { accountValid, displayName, identityKey } from "./identity";
 import { purgeGrantedAccount } from "./expiry";
 
 export function validName(name: string): boolean { return /^[A-Za-z0-9\u4e00-\u9fa5][A-Za-z0-9_.\-\u4e00-\u9fa5]{0,31}$/.test(name); }
@@ -34,6 +34,8 @@ export function buildAccount(body: Record<string, unknown>, old?: Account): Acco
     abnormalReason: text(body, "abnormalReason", old?.abnormalReason ?? "", 300),
     notifyKey: text(body, "notifyKey", old?.notifyKey ?? "", 256) || old?.notifyKey || ""
   };
+  if ("displayName" in body) account.displayName = displayName(body.displayName);
+  else if (old?.displayName) account.displayName = old.displayName;
   const previous = old ? notifyOption(old) : { method: 0, rcvOption: "" };
   const supplied = body.notifyOption && typeof body.notifyOption === "object" ? body.notifyOption as Record<string, unknown> : {};
   const method = Number(body.notifyMethod ?? supplied.method ?? ("notifyKey" in body ? (account.notifyKey ? 2 : 0) : previous.method));
@@ -90,9 +92,10 @@ export async function saveAccount(env: Env, name: string, body: Record<string, u
   const duplicate = await env.DB.prepare("SELECT name FROM accounts WHERE identity_key=? AND name!=? AND deleted=0 AND (authorization_until IS NULL OR authorization_until>?) LIMIT 1")
     .bind(identity,name,Date.now()).first();
   if(duplicate)throw new AppError("该学校账号已配置，不能重复添加",409);
-  const device = text(body, "deviceId", old?.device_id ?? "", 128);
-  // 原项目编辑时空值沿用、显式值更新；用户要求真实手机ID，不允许随机生成。
-  const deviceId = requireDeviceId(device || old?.device_id || "");
+  const device = text(body, "deviceId", "", 128);
+  const prior = !old && !device ? await env.DB.prepare("SELECT device_id FROM accounts WHERE identity_key=? AND deleted=1 AND grant_code_id IS NULL ORDER BY created_at DESC LIMIT 1")
+    .bind(identity).first<{device_id:string}>() : null;
+  const deviceId = initializeDeviceId(device, old?.device_id ?? prior?.device_id);
   const config = await seal(account, env.ENCRYPTION_KEY, `account:${name}`);
   if (create) {
     const saved = await env.DB.prepare(`INSERT INTO accounts(name,config,device_id,created_at,identity_key)

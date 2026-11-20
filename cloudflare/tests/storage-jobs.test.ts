@@ -9,6 +9,7 @@ import { seal, unseal, redact } from "../src/security";
 import { authorize } from "../src/auth";
 import { adminHeaders } from "./helpers";
 import type { Env, Schedule } from "../src/types";
+import { identityKey } from "../src/identity";
 
 const bindings = env as unknown as Env & { TEST_MIGRATIONS: any[] };
 let testEnv: Env;
@@ -45,6 +46,24 @@ describe("storage and access", () => {
     expect(raw.config).toBe(""); expect(raw.device_id).toBe(user.deviceId);
     const restored = await saveAccount(testEnv, "alice", { ...user, deviceId: "" }, true);
     expect(restored.deviceId).toBe(user.deviceId);
+  });
+  it("preserves encrypted display names independently of account IDs and bindings",async()=>{
+    await saveAccount(testEnv,"alice",{...user,displayName:"模拟同学"},true);
+    const raw=await bindings.DB.prepare("SELECT config,device_id FROM accounts WHERE name='alice'").first<any>();
+    expect(raw.config).not.toContain("模拟同学");expect((await listAccounts(testEnv))[0]).toMatchObject({name:"alice",displayName:"模拟同学"});
+    await saveAccount(testEnv,"alice",{displayName:"修改姓名",deviceId:"",password:""},false);
+    await saveAccount(testEnv,"alice",{address:"new"},false);
+    const {account,row}=await getAccount(testEnv,"alice");expect(account.displayName).toBe("修改姓名");expect(row.name).toBe("alice");expect(row.device_id).toBe(raw.device_id);
+    expect(row.identity_key).toBe(identityKey(testEnv,user.schoolName,user.username));
+  });
+  it("reuses retained bindings for the same identity under a new admin account name",async()=>{
+    await saveAccount(testEnv,"alice",user,true);await deleteAccount(testEnv,"alice");
+    expect((await saveAccount(testEnv,"restored",{...user,deviceId:""},true)).deviceId).toBe(user.deviceId);
+  });
+  it("does not silently regenerate a corrupt saved binding or accept an invalid explicit ID",async()=>{
+    await expect(saveAccount(testEnv,"bad",{...user,deviceId:"invalid id"},true)).rejects.toThrow("格式无效");
+    await saveAccount(testEnv,"alice",user,true);await bindings.DB.prepare("UPDATE accounts SET device_id='' WHERE name='alice'").run();
+    await expect(saveAccount(testEnv,"alice",{address:"new"},false)).rejects.toThrow("必须提供");
   });
   it("fails closed without secrets, rejects unauthorized and cross-origin requests", async () => {
     const ctx = createExecutionContext();

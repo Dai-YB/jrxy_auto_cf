@@ -38,8 +38,8 @@ describe("original notification behavior",()=>{
     const transport=vi.fn();
     expect(await sendNotify({...account,notifyOption:{method:0,rcvOption:"SCTexample"}},"t","m",transport)).toContain("推送未启用");
     expect(transport).not.toHaveBeenCalled();
-    transport.mockResolvedValue(new Response('{"code":1,"message":"SCTexample private-password"}'));
-    const output=await sendNotify(account,"t","m",transport);
-    expect(output).not.toContain("SCTexample");expect(output).not.toContain("private-password");
+    transport.mockResolvedValue(new Response('{"code":1,"message":"SCTexample private-password 合成姓名"}'));
+    const output=await sendNotify({...account,displayName:"合成姓名"},"t","m",transport);
+    expect(output).not.toContain("SCTexample");expect(output).not.toContain("private-password");expect(output).not.toContain("合成姓名");
   });
 });

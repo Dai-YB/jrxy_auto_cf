@@ -18,7 +18,7 @@ describe("public redemption routing and isolation",()=>{
     const headers=await adminHeaders(e);const generated=await call("/api/redemption/batches",{quantity:1,note:"模拟",schoolName:"模拟学校",type:2,lon:120,lat:30,address:"测试位置",durationValue:1,durationUnit:"days"},headers);
     expect(generated.status).toBe(201);const code=(await generated.json() as any).codes[0];
     const checked=await call("/api/public/redemption/check",{code});expect(checked.status).toBe(200);const preview=await checked.json() as any;expect(preview.schoolName).toBe("模拟学校");expect(preview).not.toHaveProperty("longitude");
-    const receipt=randomBytes(32).toString("base64url");const started=await call("/api/public/redemption/start",{code,username:"student",password:"private-password",receipt,consent:true});expect(started.status).toBe(202);
+    const receipt=randomBytes(32).toString("base64url");const started=await call("/api/public/redemption/start",{code,displayName:"模拟同学",username:"student",password:"private-password",receipt,consent:true});expect(started.status).toBe(202);
     const queued=(e.JOBS.send as any).mock.calls[0][0];expect(Object.keys(queued).sort()).toEqual(["id","kind"]);
     const transport=vi.spyOn(globalThis,"fetch").mockImplementation(async(input,init)=>{
       const url=new URL(String(input));
@@ -35,11 +35,11 @@ describe("public redemption routing and isolation",()=>{
     try{
       const batch=createMessageBatch("jrxy-auto-cf-jobs",[{id:"enrollment-message",timestamp:Date.now(),attempts:1,body:queued}]);await worker.queue(batch,e);
       expect((await getQueueResult(batch,createExecutionContext())).explicitAcks).toContain("enrollment-message");
-      const result=await(await call("/api/public/redemption/status",{receipt})).json() as any;expect(result.status).toBe("succeeded");
+      const result=await(await call("/api/public/redemption/status",{receipt})).json() as any;expect(result.status).toBe("succeeded");expect(result.schedule.enabled).toBe(true);expect(result.schedule.timezone).toBe("UTC+8");
       expect(JSON.stringify(result)).not.toContain("private-password");expect(JSON.stringify(result)).not.toContain("mock-cookie");
       expect(transport.mock.calls.some(([url])=>String(url).includes("submitSign")||String(url).includes("sctapi"))).toBe(false);
       const admin=await(await call("/api/accounts",undefined,headers)).json() as any;expect(admin.accounts).toHaveLength(1);expect(admin.accounts[0].notify_method).toBe(0);
-      const reuse=await call("/api/public/redemption/start",{code,username:"other",password:"other-password",receipt:randomBytes(32).toString("base64url"),consent:true});expect(reuse.status).toBe(409);
+      const reuse=await call("/api/public/redemption/start",{code,displayName:"模拟同学",username:"other",password:"other-password",receipt:randomBytes(32).toString("base64url"),consent:true});expect(reuse.status).toBe(409);
     }finally{transport.mockRestore();}
   });
 });

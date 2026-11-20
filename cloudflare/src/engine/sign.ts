@@ -88,9 +88,9 @@ function rangeResult(task: any, signWid?: unknown): Result {
 async function runExecution(account: Account, deviceId: string, mode: Mode, options: ExecutionOptions, trace: string[]): Promise<Result> {
   let submitted = Boolean(options.checkpoint);
   try { requireDeviceId(deviceId); }
-  catch { return { status: "fail", message: "缺少或无效的手机原绑定 deviceId，未发起登录；请先迁移或提取真实 ID" }; }
+  catch { return { status: "fail", message: "已保存的 deviceId 缺失或格式无效，未发起登录；请检查账号设备配置" }; }
   try {
-    trace.push("步骤 1/5 登录（使用已保存的真实设备绑定）");
+    trace.push("步骤 1/5 登录（使用已保存的固定设备标识）");
     const auth = await (options.loginFn ?? login)(account,new Session(fetch,options.httpTimeoutMs,options.runTimeoutMs));
     trace.push("登录成功；Cookie 与会话令牌不写入日志");
     if(mode === "login")return {status:"success",message:"登录成功",data:{host:auth.host,cookies:auth.session.jar.names()}};

@@ -5,9 +5,14 @@ import { AppError } from "../types";
 
 export function requireDeviceId(value: string): string {
   const id = value.trim();
-  if (!id) throw new AppError("必须提供手机原绑定 deviceId；请从旧 .device_id 文件迁移或从本人 App 请求头提取，不会自动生成");
+  if (!id) throw new AppError("必须提供已保存的 deviceId；请检查账号设备配置");
   if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(id)) throw new AppError("deviceId 格式无效");
   return id;
+}
+export function initializeDeviceId(supplied = "", saved?: string): string {
+  if (supplied.trim()) return requireDeviceId(supplied);
+  // 仅首次创建时生成；已存记录损坏不能静默换绑。
+  return requireDeviceId(saved === undefined ? crypto.randomUUID() : saved);
 }
 export function extractDeviceId(value: string, header: "info" | "ext", encoding: "base64" | "hex"): string {
   if (typeof value !== "string" || !value.trim() || value.length > 8192) throw new AppError("请提供不超过8KB的请求头值");

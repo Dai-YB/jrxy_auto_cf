@@ -1,12 +1,14 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { AppError, EngineError, type Account, type AccountRow, type Env } from "./types";
+import { AppError, EngineError, type Account, type AccountRow, type Env, type RequestDiagnostic } from "./types";
+import { safeDiagnostic } from "./diagnostics";
 import { requireConfigured, requireSameOrigin, readJson, seal, unseal } from "./security";
-import { identityKey } from "./identity";
+import { displayName, identityKey } from "./identity";
 import { rateLimit } from "./auth";
 import { login } from "./engine/login";
 import { Session } from "./engine/http";
+import { initializeDeviceId } from "./engine/device";
 import { settings, localTime } from "./config";
-import { scheduleView } from "./scheduler";
+import { getSchedule, scheduleView } from "./scheduler";
 
 interface Preset {
   id:string;note:string;school_name:string;task_type:1|2;longitude:number;latitude:number;address:string;
@@ -16,13 +18,17 @@ interface CodeRow {id:string;batch_id:string;code_hash:string;suffix:string;stat
 interface Attempt {
   id:string;code_id:string;receipt_hash:string;request_hash:string;identity_key:string|null;credentials:string;status:string;
   owner:string|null;lease_until:number;created_at:number;expires_at:number;dispatched_at:number;
-  account_name:string|null;account_config:string;device_id:string;error_code:string|null;authorization_until:number|null;
+  account_name:string|null;account_config:string;device_id:string;error_code:string|null;authorization_until:number|null;diagnostic:string|null;
 }
 const ATTEMPT_MS=10*60_000;
 const messages:Record<string,string>={
   invalid:"兑换码无效或不可用",used:"兑换码已使用，不能再次兑换",expired:"兑换码已过最晚兑换时间",revoked:"兑换码已撤销",
-  busy:"兑换码正在验证，请等待当前操作完成",credentials:"账号或密码验证失败，请核对后重试",captcha:"学校登录需要人工验证，本次未开通且未消耗兑换码",
-  network:"学校网络暂不可用，本次未开通且未消耗兑换码",unsupported:"该学校登录方式暂不支持，本次未开通且未消耗兑换码",
+  busy:"兑换码正在验证，请等待当前操作完成",credentials:"学校登录未通过，请核对账号密码或联系管理员查看诊断；本次未开通且未消耗兑换码",captcha:"学校登录需要人工验证，本次未开通且未消耗兑换码",
+  network:"登录验证链路连接失败，请联系管理员查看诊断；本次未开通且未消耗兑换码",
+  timeout:"登录验证链路请求超时，请联系管理员查看诊断；本次未开通且未消耗兑换码",
+  upstream:"登录验证接口返回异常状态，请联系管理员查看诊断；本次未开通且未消耗兑换码",
+  protocol:"登录验证响应或协议不兼容，请联系管理员查看诊断；本次未开通且未消耗兑换码",
+  unsupported:"该学校登录方式暂不支持，本次未开通且未消耗兑换码",
   duplicate:"该学校账号已配置，请联系管理员处理",interrupted:"验证中断或超时，请重新提交；本次未消耗兑换码",
   conflict:"账号设置未完成，请联系管理员核实",unknown:"验证未完成，请稍后重试",expired_account:"授权已到期，账号资料已进入清理流程"
 };
@@ -132,7 +138,7 @@ export async function publicRedemption(request:Request,env:Env,path:string):Prom
   if(path==="/api/public/redemption/check"){
     const {code,preset}=await loadCode(env,body.code);available(code,preset);
     const schedule=await scheduleView(env);
-    return reply({schoolName:preset.school_name,type:preset.task_type,durationSeconds:preset.duration_seconds,redeemBefore:preset.redeem_before,schedule:{enabled:schedule.enabled,time:schedule.time,timezone:schedule.timezone}});
+    return reply({schoolName:preset.school_name,type:preset.task_type,durationSeconds:preset.duration_seconds,redeemBefore:preset.redeem_before,schedule:{enabled:schedule.enabled,autoEnableOnEnrollment:schedule.autoEnableOnEnrollment,time:schedule.time,timezone:schedule.timezone}});
   }
   if(path!=="/api/public/redemption/start")throw new AppError("接口不存在",404);
   if(body.consent!==true)throw new AppError("请确认仅使用本人或已获授权账号，并同意有效期内保存必要信息");
@@ -140,9 +146,12 @@ export async function publicRedemption(request:Request,env:Env,path:string):Prom
   const receipt=receiptValue(body.receipt),username=cleanText(body.username,100,"账号");
   if(typeof body.password!=="string"||!body.password||body.password.length>256)throw new AppError("请填写有效密码");
   const codeText=codeValue(body.code);
-  const requestHash=hash(env,"enrollment-request",JSON.stringify([codeText,username,body.password]));
+  const name=body.displayName===undefined?undefined:displayName(body.displayName);
+  const fields=[codeText,username,body.password];if(name!==undefined)fields.push(name);
+  const requestHash=hash(env,"enrollment-request",JSON.stringify(fields));
   const old=await env.DB.prepare("SELECT request_hash FROM enrollment_attempts WHERE receipt_hash=?").bind(hash(env,"enrollment-receipt",receipt)).first<{request_hash:string}>();
   if(old){if(old.request_hash!==requestHash)throw new AppError("当前操作已提交，请等待结果或重新开始",409);return reply(await enrollmentStatus(env,receipt),202);}
+  if(name===undefined)throw new AppError("请填写姓名；如果页面没有姓名输入框，请刷新后重试");
   const {code,preset}=await loadCode(env,body.code);available(code,preset);
   await rateLimit(env,"redemption-code:"+code.id,5,15*60_000);
   const identity=identityKey(env,preset.school_name,username);
@@ -150,7 +159,7 @@ export async function publicRedemption(request:Request,env:Env,path:string):Prom
   await identityReady(env);
   if(await duplicateIdentity(env,identity))throw new AppError(messages.duplicate,409);
   const id=crypto.randomUUID(),now=Date.now(),expires=now+ATTEMPT_MS;
-  const credentials=await seal({username,password:body.password},env.ENCRYPTION_KEY,`enrollment:${id}`);
+  const credentials=await seal({username,password:body.password,displayName:name},env.ENCRYPTION_KEY,`enrollment:${id}`);
   const rows=await env.DB.batch([
     env.DB.prepare(`UPDATE redemption_codes SET status='reserved',attempt_id=?,reserved_until=? WHERE id=? AND status='unused'
       AND NOT EXISTS(SELECT 1 FROM enrollment_attempts e WHERE e.identity_key=? AND e.status IN('pending','verifying','ready') AND e.expires_at>?)
@@ -175,13 +184,24 @@ async function sendEnrollment(env:Env,id:string):Promise<void> {
   if(!claimed)return;
   try{await env.JOBS.send({kind:"enrollment",id});}catch{await env.DB.prepare("UPDATE enrollment_attempts SET dispatched_at=0 WHERE id=? AND dispatched_at=?").bind(id,now).run();}
 }
-async function failAttempt(env:Env,id:string,reason:string):Promise<void> {
+async function failAttempt(env:Env,id:string,reason:string,diagnostic?:RequestDiagnostic|null):Promise<void> {
+  const safe=safeDiagnostic(diagnostic);
   await env.DB.batch([
     env.DB.prepare(`UPDATE redemption_codes SET status='unused',attempt_id=NULL,reserved_until=NULL WHERE status='reserved' AND attempt_id=?
       AND EXISTS(SELECT 1 FROM enrollment_attempts WHERE id=? AND status!='succeeded')`).bind(id,id),
-    env.DB.prepare(`UPDATE enrollment_attempts SET status='failed',credentials='',identity_key=NULL,account_config='',device_id='',account_name=NULL,owner=NULL,lease_until=0,error_code=?
-      WHERE id=? AND status!='succeeded'`).bind(reason,id)
+    env.DB.prepare(`UPDATE enrollment_attempts SET status='failed',credentials='',identity_key=NULL,account_config='',device_id='',account_name=NULL,owner=NULL,lease_until=0,error_code=?,diagnostic=?
+      WHERE id=? AND status NOT IN('succeeded','failed')`).bind(reason,safe?JSON.stringify(safe):null,id)
   ]);
+}
+export async function listEnrollments(env:Env):Promise<unknown[]> {
+  const rows=await env.DB.prepare(`SELECT e.created_at,e.status,e.error_code,e.diagnostic,c.suffix FROM enrollment_attempts e
+    JOIN redemption_codes c ON c.id=e.code_id WHERE e.expires_at>? ORDER BY e.created_at DESC,e.id DESC LIMIT 50`).bind(Date.now()).all<Pick<Attempt,"created_at"|"status"|"error_code"|"diagnostic"> & {suffix:string}>();
+  return rows.results.map(row=>{
+    let diagnostic:RequestDiagnostic|null=null;
+    try{diagnostic=safeDiagnostic(JSON.parse(row.diagnostic??"null"));}catch{}
+    return {createdAt:localTime(row.created_at,settings(env).timezone),timezone:`UTC${settings(env).timezone>=0?"+":""}${settings(env).timezone}`,
+      status:row.status,suffix:row.suffix,message:row.error_code?(messages[row.error_code]||messages.unknown):null,diagnostic};
+  });
 }
 export async function enrollmentStatus(env:Env,receipt:string):Promise<unknown> {
   const attempt=await env.DB.prepare("SELECT * FROM enrollment_attempts WHERE receipt_hash=? AND expires_at>?").bind(hash(env,"enrollment-receipt",receipt),Date.now()).first<Attempt>();
@@ -220,14 +240,21 @@ export async function processEnrollment(env:Env,id:string,loginFn=login):Promise
       return;
     }
     attempt=claimed;
+    let privateValues:string[]=[];
     try{
       if(await duplicateIdentity(env,attempt.identity_key!)){await failAttempt(env,id,"duplicate");return;}
-      const credentials=await unseal<{username:string;password:string}>(attempt.credentials,env.ENCRYPTION_KEY,`enrollment:${id}`);
+      const credentials=await unseal<{username:string;password:string;displayName?:string}>(attempt.credentials,env.ENCRYPTION_KEY,`enrollment:${id}`);
       const account:Account={schoolName:preset.school_name,type:preset.task_type,username:credentials.username,password:credentials.password,
         lon:preset.longitude,lat:preset.latitude,address:preset.address,abnormalReason:"",notifyKey:"",notifyOption:{method:0,rcvOption:""},checkTitle:0};
-      await loginFn(account,new Session(fetch,settings(env).httpTimeoutMs,settings(env).runTimeoutMs));
+      if(credentials.displayName!==undefined)account.displayName=displayName(credentials.displayName);
+      privateValues=[credentials.username,credentials.password,credentials.displayName??""];
       const prior=await env.DB.prepare("SELECT device_id FROM accounts WHERE identity_key=? AND deleted=1 AND grant_code_id IS NULL ORDER BY created_at DESC LIMIT 1").bind(attempt.identity_key).first<{device_id:string}>();
-      const device=prior?.device_id||crypto.randomUUID();
+      const device=initializeDeviceId("",attempt.device_id||prior?.device_id);
+      const prepared=await env.DB.prepare(`UPDATE enrollment_attempts SET device_id=? WHERE id=? AND status='verifying' AND owner=? AND lease_until>? AND expires_at>?
+        AND EXISTS(SELECT 1 FROM redemption_codes c WHERE c.id=code_id AND c.status='reserved' AND c.attempt_id=enrollment_attempts.id) RETURNING id`)
+        .bind(device,id,owner,Date.now(),Date.now()).first();
+      if(!prepared){await failAttempt(env,id,"interrupted");return;}
+      await loginFn(account,new Session(fetch,settings(env).httpTimeoutMs,settings(env).runTimeoutMs));
       const name="u_"+randomBytes(10).toString("hex");
       const encrypted=await seal(account,env.ENCRYPTION_KEY,`account:${name}`);
       const ready=await env.DB.prepare(`UPDATE enrollment_attempts SET status='ready',account_name=?,account_config=?,device_id=?,credentials='',owner=NULL,lease_until=0,dispatched_at=0
@@ -235,27 +262,36 @@ export async function processEnrollment(env:Env,id:string,loginFn=login):Promise
       if(!ready){await failAttempt(env,id,"interrupted");return;}
       attempt=ready;
     }catch(error){
-      const reason=error instanceof EngineError?(error.status==="captcha"?"captcha":error.retryable?"network":error.status==="unsupported"?"unsupported":"credentials"):"unknown";
-      await failAttempt(env,id,reason);return;
+      const diagnostic=safeDiagnostic(error instanceof EngineError?error.diagnostic:{stage:"setup",kind:"internal"},privateValues);
+      const kind=diagnostic?.kind;
+      const reason=error instanceof EngineError?(error.status==="captcha"?"captcha":error.status==="unsupported"?"unsupported":
+        kind==="timeout"||kind==="total_timeout"?"timeout":kind==="http"?"upstream":kind==="transport"||error.retryable?"network":
+        error.status==="error"||["policy","request_limit","redirect_limit","internal"].includes(kind??"")?"protocol":"credentials"):"unknown";
+      await failAttempt(env,id,reason,diagnostic);return;
     }
   }
   if(attempt.status!=="ready")return;
   await identityReady(env);
+  await getSchedule(env);
   const activated=Date.now(),until=activated+preset.duration_seconds*1000;
   const rows=await env.DB.batch([
-    env.DB.prepare(`INSERT OR IGNORE INTO accounts(name,config,device_id,created_at,identity_key,grant_code_id,authorization_from,authorization_until)
-      SELECT a.account_name,a.account_config,a.device_id,?,a.identity_key,a.code_id,?,? FROM enrollment_attempts a
+    env.DB.prepare(`INSERT OR IGNORE INTO accounts(name,config,device_id,created_at,identity_key,grant_code_id,authorization_from,authorization_until,resume_after)
+      SELECT a.account_name,a.account_config,a.device_id,?,a.identity_key,a.code_id,?,?,? FROM enrollment_attempts a
       JOIN redemption_codes c ON c.id=a.code_id JOIN redemption_batches b ON b.id=c.batch_id
       WHERE a.id=? AND a.status='ready' AND a.expires_at>? AND c.status='reserved' AND c.attempt_id=a.id AND c.reserved_until>?
       AND (b.redeem_before IS NULL OR b.redeem_before>?)
       AND NOT EXISTS(SELECT 1 FROM accounts old WHERE old.deleted=0 AND (old.identity_key=a.identity_key OR old.identity_key IS NULL))`)
-      .bind(activated,activated,until,id,activated,activated,activated),
+      .bind(activated,activated,until,activated,id,activated,activated,activated),
     env.DB.prepare(`UPDATE redemption_codes SET status='used',used_at=?,authorization_until=?,attempt_id=NULL,reserved_until=NULL WHERE id=? AND status='reserved' AND attempt_id=?
       AND EXISTS(SELECT 1 FROM accounts a JOIN enrollment_attempts e ON a.name=e.account_name WHERE e.id=? AND e.status='ready' AND a.grant_code_id=redemption_codes.id)`)
       .bind(activated,until,attempt.code_id,id,id),
     env.DB.prepare(`UPDATE enrollment_attempts SET status='succeeded',credentials='',identity_key=NULL,account_config='',device_id='',owner=NULL,lease_until=0,authorization_until=?
       WHERE id=? AND status='ready' AND EXISTS(SELECT 1 FROM redemption_codes WHERE id=code_id AND status='used')
-      AND EXISTS(SELECT 1 FROM accounts WHERE name=enrollment_attempts.account_name AND grant_code_id=enrollment_attempts.code_id) RETURNING id`).bind(until,id)
+      AND EXISTS(SELECT 1 FROM accounts WHERE name=enrollment_attempts.account_name AND grant_code_id=enrollment_attempts.code_id) RETURNING id`).bind(until,id),
+    // 初始计划才自动开启；管理员保存过的开关不可被兑换覆盖。
+    env.DB.prepare(`UPDATE schedule SET enabled=1,revision=revision+1,effective_after=? WHERE id=1 AND enabled=0 AND revision=1
+      AND EXISTS(SELECT 1 FROM enrollment_attempts e JOIN accounts a ON a.name=e.account_name
+        WHERE e.id=? AND e.status='succeeded' AND a.grant_code_id=e.code_id AND a.authorization_until>?)`).bind(activated,id,activated)
   ]);
   if(!rows[2].results.length)await failAttempt(env,id,"conflict");
 }

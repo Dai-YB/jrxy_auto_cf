@@ -36,7 +36,7 @@ export function notification(name: string, result: Result, trigger: string, dry:
 export async function sendNotify(account: Account, title: string, message: string, transport: typeof fetch = fetch): Promise<string> {
   const option = notifyOption(account);
   if (Number(option.method) !== 2 || !option.rcvOption.trim()) return "推送未启用（账号未配置 Server酱）";
-  const redactResponse = (s: string) => redact(s,[account.password, option.rcvOption, account.username]);
+  const redactResponse = (s: string) => redact(s,[account.password, option.rcvOption, account.username, account.displayName??""]);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
   try {

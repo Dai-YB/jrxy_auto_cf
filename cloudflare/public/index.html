@@ -15,7 +15,7 @@
     <h2 id="enrollTitle">验证兑换码</h2><p class="enroll-description" id="enrollDescription">每个兑换码仅可绑定一个账号，成功开通后不可重复使用。</p>
     <form id="codeForm"><label for="redeemCode">兑换码</label><input id="redeemCode" maxlength="100" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="请输入你的兑换码" required><button type="submit" id="checkCode" class="button primary full">验证兑换码 <span aria-hidden="true">→</span></button></form>
     <div id="presetPanel" class="preset-panel" hidden><div><span>学校</span><strong id="presetSchool">—</strong></div><div><span>签到形式</span><strong id="presetType">—</strong></div><div><span>使用时长</span><strong id="presetDuration">—</strong></div><div><span>每日安排</span><strong id="presetSchedule">—</strong></div></div>
-    <form id="enrollForm" hidden><label for="schoolUsername">学校账号 / 学号</label><input id="schoolUsername" maxlength="100" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="请输入学校账号" required><label for="schoolPassword">学校密码</label><div class="password-wrap"><input id="schoolPassword" type="password" maxlength="256" autocomplete="current-password" placeholder="请输入学校密码" required><button id="showSchoolPassword" type="button" class="password-toggle" aria-label="显示学校密码" aria-pressed="false">显示</button></div>
+    <form id="enrollForm" hidden><label for="enrollmentName">姓名</label><input id="enrollmentName" maxlength="50" autocomplete="name" placeholder="用于后台账号名称" required><label for="schoolUsername">学校账号 / 学号</label><input id="schoolUsername" maxlength="100" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="请输入学校账号" required><label for="schoolPassword">学校密码</label><div class="password-wrap"><input id="schoolPassword" type="password" maxlength="256" autocomplete="current-password" placeholder="请输入学校密码" required><button id="showSchoolPassword" type="button" class="password-toggle" aria-label="显示学校密码" aria-pressed="false">显示</button></div>
       <label class="enroll-consent"><input id="consent" type="checkbox" required><span>这是本人或已获授权的账号。我同意在有效期内加密保存账号信息用于签到，到期停止并清理对应资料。</span></label>
       <button id="saveEnrollment" type="submit" class="button primary full">验证并保存签到设置 <span aria-hidden="true">→</span></button><button id="changeCode" type="button" class="button text-button full">更换兑换码</button>
     </form>
@@ -24,6 +24,6 @@
     <p id="enrollError" class="inline-error" role="alert" hidden></p>
     <button id="retryStatus" class="button full" type="button" hidden>重新查询验证结果</button>
   </section>
-  <p class="enroll-footnote">只需兑换码、账号和密码。登录通过后沿用已有设备标识，或按原项目规则首次生成并固定；不是读取手机硬件ID。若学校要求验证码或设备授权，需要人工处理。</p>
+  <p class="enroll-footnote">填写兑换码、姓名、学校账号和密码。验证前沿用已有设备标识，或按原项目规则首次生成并固定，登录通过后才开通；不是读取手机硬件ID。若学校要求验证码或设备授权，需要人工处理。</p>
 </main><footer class="enroll-footer">jrxy_auto_cf · 仅供学习使用</footer>
 </body></html>

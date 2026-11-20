@@ -39,7 +39,7 @@ export async function scheduleView(env: Env): Promise<Record<string, unknown>> {
   const s = await getSchedule(env, now);
   let next = todaySlot(s.time, now, cfg.timezone);
   if (next <= Math.max(now, s.effective_after)) next += DAY;
-  return { enabled: Boolean(s.enabled), time: s.time, timezone: `UTC${cfg.timezone >= 0 ? "+" : ""}${cfg.timezone}`,
+  return { enabled: Boolean(s.enabled), autoEnableOnEnrollment: !s.enabled && s.revision===1, time: s.time, timezone: `UTC${cfg.timezone >= 0 ? "+" : ""}${cfg.timezone}`,
     next: s.enabled ? localTime(next, cfg.timezone) : null, last_slot: s.last_slot,
     last_run: s.last_run ? localTime(s.last_run, cfg.timezone) : null, last_result: s.last_result,
     note: "按分钟触发；已开始的批次会继续，后续重试与通知不依赖页面连接" };

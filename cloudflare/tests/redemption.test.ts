@@ -4,7 +4,9 @@ import {reset,applyD1Migrations} from "cloudflare:test";
 import {randomBytes} from "node:crypto";
 import {createCodeBatch,publicRedemption,processEnrollment,cleanupEnrollments,enrollmentStatus,revokeCode} from "../src/redemption";
 import {cleanupExpiredAccounts} from "../src/expiry";
-import {getAccount,saveAccount,deleteAccount} from "../src/storage";
+import {getAccount,saveAccount,deleteAccount,listAccounts} from "../src/storage";
+import {seal} from "../src/security";
+import {createHmac} from "node:crypto";
 import {enqueue,processJob} from "../src/jobs";
 import {EngineError,type Env} from "../src/types";
 import {identityKey} from "../src/identity";
@@ -16,7 +18,7 @@ const receipt=()=>randomBytes(32).toString("base64url");
 function request(path:string,body:unknown){return new Request("https://manager.example"+path,{method:"POST",headers:{Origin:"https://manager.example","Content-Type":"application/json"},body:JSON.stringify(body)});}
 async function start(code:string,token=receipt(),extra:Record<string,unknown>={}){
   const path="/api/public/redemption/start";
-  const body={code,username:"student",password:"private-password",receipt:token,consent:true,...extra};
+  const body={code,displayName:"模拟同学",username:"student",password:"private-password",receipt:token,consent:true,...extra};
   const response=await publicRedemption(request(path,body),e,path);
   const row=await e.DB.prepare("SELECT * FROM enrollment_attempts ORDER BY created_at DESC LIMIT 1").first<any>();
   return {row,token,body,response};
@@ -33,17 +35,48 @@ describe("one-time redemption enrollment",()=>{
   it("does not activate before verified and ignores user overrides of batch preset and notifications",async()=>{
     const batch=await createCodeBatch(e,preset) as any;const {row,token}=await start(batch.codes[0],receipt(),{schoolName:"tampered",type:1,lon:0,address:"wrong",notifyOption:{method:2,rcvOption:"SCTwrong"}});
     expect((await e.DB.prepare("SELECT count(*) AS n FROM accounts").first<any>()).n).toBe(0);
+    expect((await e.DB.prepare("SELECT enabled FROM schedule").first<any>()).enabled).toBe(0);
     expect(row.credentials).not.toContain("private-password");expect(e.JOBS.send).toHaveBeenCalledWith({kind:"enrollment",id:row.id});
-    const login=loggedIn();await processEnrollment(e,row.id,login);
-    expect(login.mock.calls[0][0]).toMatchObject({schoolName:preset.schoolName,type:2,lon:120,lat:30,address:preset.address,notifyOption:{method:0,rcvOption:""}});
+    expect(row.credentials).not.toContain("模拟同学");
+    let preparedDevice="";
+    const login=vi.fn(async(_account:any)=>{const prepared=await e.DB.prepare("SELECT device_id,status FROM enrollment_attempts WHERE id=?").bind(row.id).first<any>();preparedDevice=prepared.device_id;expect(preparedDevice).toMatch(/^[a-f0-9-]{36}$/);expect(prepared.status).toBe("verifying");return {} as any;});
+    await processEnrollment(e,row.id,login);
+    expect(login.mock.calls[0][0]).toMatchObject({displayName:"模拟同学",schoolName:preset.schoolName,type:2,lon:120,lat:30,address:preset.address,notifyOption:{method:0,rcvOption:""}});
     const stored=await e.DB.prepare("SELECT * FROM accounts").first<any>();
-    expect(stored.device_id).toMatch(/^[a-f0-9-]{36}$/);expect(stored.authorization_until-stored.authorization_from).toBe(7200000);
-    const status=await enrollmentStatus(e,token) as any;expect(status.status).toBe("succeeded");expect(status.message).toBe("签到设置成功");
+    expect(stored.device_id).toBe(preparedDevice);expect(stored.authorization_until-stored.authorization_from).toBe(7200000);
+    expect(stored.config).not.toContain("模拟同学");expect((await getAccount(e,stored.name)).account.displayName).toBe("模拟同学");
+    expect((await listAccounts(e))[0]).toMatchObject({name:stored.name,displayName:"模拟同学"});
+    const status=await enrollmentStatus(e,token) as any;expect(status.status).toBe("succeeded");expect(status.message).toBe("签到设置成功");expect(status.schedule.enabled).toBe(true);
+    expect((await e.DB.prepare("SELECT count(*) AS n FROM jobs").first<any>()).n).toBe(0);expect(stored.paused).toBe(0);expect(stored.resume_after).toBe(stored.authorization_from);
     const attempt=await e.DB.prepare("SELECT * FROM enrollment_attempts WHERE id=?").bind(row.id).first<any>();
     expect(attempt.credentials).toBe("");expect(attempt.account_config).toBe("");expect(attempt.device_id).toBe("");expect(attempt.identity_key).toBeNull();
     await processEnrollment(e,row.id,login);expect(login).toHaveBeenCalledTimes(1);
     expect((await e.DB.prepare("SELECT device_id FROM accounts").first<any>()).device_id).toBe(stored.device_id);
     await expect(start(batch.codes[0])).rejects.toThrow("已使用");
+  });
+  it("requires a valid display name without consuming codes on invalid input",async()=>{
+    const batch=await createCodeBatch(e,preset) as any;
+    for(const value of [undefined,"","   ","a".repeat(51),"名字\u0000","名字\u202e","<script>",12])await expect(start(batch.codes[0],receipt(),{displayName:value})).rejects.toThrow("姓名");
+    expect((await e.DB.prepare("SELECT status FROM redemption_codes").first<any>()).status).toBe("unused");
+    expect((await e.DB.prepare("SELECT count(*) AS n FROM enrollment_attempts").first<any>()).n).toBe(0);
+  });
+  it("keeps same-name users separate and includes their name in idempotency validation",async()=>{
+    const batch=await createCodeBatch(e,{...preset,quantity:2}) as any;
+    const first=await start(batch.codes[0],receipt(),{displayName:"  模拟·同学  "});await processEnrollment(e,first.row.id,loggedIn());
+    await expect(start(batch.codes[0],first.token,{displayName:"另一个姓名"})).rejects.toThrow("当前操作已提交");
+    const second=await start(batch.codes[1],receipt(),{username:"other-student",displayName:"模拟·同学"});await processEnrollment(e,second.row.id,loggedIn());
+    const accounts=await listAccounts(e);expect(accounts).toHaveLength(2);expect(accounts.every(a=>a.displayName==="模拟·同学")).toBe(true);
+    expect(new Set(accounts.map(a=>a.name)).size).toBe(2);expect(new Set(accounts.map(a=>a.deviceId)).size).toBe(2);
+    expect(JSON.stringify(await enrollmentStatus(e,first.token))).not.toContain("模拟·同学");
+  });
+  it("finishes pre-upgrade pending attempts without requiring an unavailable name",async()=>{
+    const batch=await createCodeBatch(e,preset) as any;const first=await start(batch.codes[0]);
+    const oldHash=createHmac("sha256",e.ENCRYPTION_KEY).update("enrollment-request:"+JSON.stringify([batch.codes[0].replace(/-/g,""),"student","private-password"])).digest("hex");
+    await e.DB.prepare("UPDATE enrollment_attempts SET credentials=?,request_hash=? WHERE id=?")
+      .bind(await seal({username:"student",password:"private-password"},e.ENCRYPTION_KEY,`enrollment:${first.row.id}`),oldHash,first.row.id).run();
+    const repeated={...first.body,displayName:undefined};expect((await publicRedemption(request("/api/public/redemption/start",repeated),e,"/api/public/redemption/start")).status).toBe(202);
+    await processEnrollment(e,first.row.id,loggedIn());expect((await enrollmentStatus(e,first.token) as any).status).toBe("succeeded");
+    expect((await listAccounts(e))[0].displayName).toBeUndefined();
   });
   it("allows only one concurrent reservation and treats the same receipt idempotently",async()=>{
     const batch=await createCodeBatch(e,preset) as any;
@@ -67,7 +100,8 @@ describe("one-time redemption enrollment",()=>{
     await processEnrollment(e,row.id,vi.fn().mockRejectedValue(error));
     expect((await enrollmentStatus(e,token) as any).status).toBe("failed");
     expect((await e.DB.prepare("SELECT status FROM redemption_codes").first<any>()).status).toBe("unused");
-    const stored=await e.DB.prepare("SELECT credentials,identity_key FROM enrollment_attempts").first<any>();expect(stored.credentials).toBe("");expect(stored.identity_key).toBeNull();
+    const stored=await e.DB.prepare("SELECT credentials,identity_key,device_id FROM enrollment_attempts").first<any>();expect(stored.credentials).toBe("");expect(stored.identity_key).toBeNull();expect(stored.device_id).toBe("");
+    expect((await e.DB.prepare("SELECT enabled FROM schedule").first<any>()).enabled).toBe(0);
     expect((await e.DB.prepare("SELECT count(*) AS n FROM accounts").first<any>()).n).toBe(0);
   });
   it("reuses a safely retained original device binding and never replaces an active account",async()=>{
@@ -155,6 +189,7 @@ describe("one-time redemption enrollment",()=>{
     await expect(processEnrollment(e,row.id,loggedIn())).rejects.toThrow();
     expect((await e.DB.prepare("SELECT count(*) AS n FROM accounts").first<any>()).n).toBe(0);
     const ready=await e.DB.prepare("SELECT status,device_id FROM enrollment_attempts WHERE id=?").bind(row.id).first<any>();expect(ready.status).toBe("ready");
+    expect((await e.DB.prepare("SELECT enabled FROM schedule").first<any>()).enabled).toBe(0);
     await e.DB.exec("DROP TRIGGER reject_code_use;");const login=loggedIn();await processEnrollment(e,row.id,login);expect(login).not.toHaveBeenCalled();
     expect((await e.DB.prepare("SELECT device_id FROM accounts").first<any>()).device_id).toBe(ready.device_id);
   });

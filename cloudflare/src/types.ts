@@ -19,6 +19,7 @@ export interface Env {
 }
 
 export interface Account {
+  displayName?: string;
   schoolName: string;
   username: string;
   password: string;
@@ -111,8 +112,17 @@ export interface Schedule {
 export class AppError extends Error {
   constructor(message: string, public code = 400) { super(message); }
 }
+export type RequestStage = "request" | "tenant_list" | "tenant_info" | "portal" | "login_form" | "login_ticket" | "captcha_check" | "login_submit" | "login_callback" | "setup";
+export interface RequestDiagnostic {
+  stage: RequestStage;
+  kind: "timeout" | "total_timeout" | "transport" | "http" | "response" | "request_limit" | "redirect_limit" | "policy" | "internal";
+  host?: string;
+  method?: "GET" | "POST" | "HEAD";
+  httpStatus?: number;
+  elapsedMs?: number;
+}
 export class EngineError extends Error {
-  constructor(message: string, public status: Result["status"] = "fail", public retryable = false) { super(message); }
+  constructor(message: string, public status: Result["status"] = "fail", public retryable = false, public diagnostic?: RequestDiagnostic) { super(message); }
 }
 export const LABELS: Record<Result["status"], string> = {
   success: "签到成功", already: "今日已签到", no_task: "暂无待签任务", dry: "探测通过",

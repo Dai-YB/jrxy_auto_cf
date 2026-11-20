@@ -20,10 +20,13 @@ assert.ok(html.includes('autocomplete="current-password"')&&html.includes('autoc
 const select=html.match(/<select id="accountType"[\s\S]*?<\/select>/)[0];
 assert.deepEqual([...select.matchAll(/value="(\d+)"/g)].map(m=>m[1]).sort(),["1","2"],"仅支持签到与查寝");
 assert.match(html,/<input id="codeQuantity"[^>]*min="1"[^>]*max="10"[^>]*step="1"/);
+assert.ok(!/\brequired\b/.test(html.match(/<input id="accountDevice"[^>]*>/)[0]),"后台新账号设备ID默认自动处理");
+assert.ok(ids.includes("enrollmentList")&&ids.includes("refreshEnrollments"),"后台需要脱敏验证诊断");
 const userHtml=read("index.html"),userJs=read("enroll.js");
 const userIds=checkPage(userHtml,userJs,"enroll.js");
-for(const id of ["codeForm","redeemCode","enrollForm","schoolUsername","schoolPassword","enrollProgress","enrollSuccess"])
+for(const id of ["codeForm","redeemCode","enrollForm","enrollmentName","schoolUsername","schoolPassword","enrollProgress","enrollSuccess"])
   assert.ok(userIds.includes(id),"缺少用户开通控件："+id);
+assert.match(userHtml,/<input id="enrollmentName"[^>]*maxlength="50"[^>]*required/);
 assert.ok(!userIds.includes("loginForm")&&!userIds.includes("accountRows"),"默认页不得展示管理员数据");
 assert.ok(!/storage\.setItem/i.test(userJs),"用户凭据与兑换码不持久化到浏览器");
 assert.ok(!/name="(?:lon|lat|schoolName|deviceId|notifyRcv)"/.test(userHtml),"用户不能输入后台预设字段");

@@ -51,7 +51,7 @@ function showLogin() {
   for(const dialog of [$("accountDialog"),$("confirmDialog")])if(dialog.open)dialog.close();
   if(confirmResolve){confirmResolve(false);confirmResolve=null;}
   $("accountForm").reset();$("accountRows").replaceChildren();$("accountCards").replaceChildren();$("logList").replaceChildren();
-  $("codeBatchForm").reset();$("codeBatchList").replaceChildren();hideGeneratedCodes();
+  $("codeBatchForm").reset();$("codeBatchList").replaceChildren();$("enrollmentList").replaceChildren();hideGeneratedCodes();
   $("boot").hidden=true;$("appView").hidden=true;$("loginView").hidden=false;$("taskResult").hidden=true;$("toast").hidden=true;
   $("loginPassword").value="";
 }
@@ -106,10 +106,12 @@ async function loadAccounts() {
   const result=await api("/api/accounts");if(!signedIn)return;
   accounts=result.accounts;renderAccounts();
 }
+function accountLabel(account) { return account.displayName||account.name; }
+function accountName(name) { const account=accounts.find(item=>item.name===name);return account?accountLabel(account):name; }
 function identity(account) {
   const block=element("div",undefined,"account-identity");
-  block.append(element("span",account.name.slice(0,1),"account-avatar"));
-  const info=element("div");info.append(element("b",account.name),element("small",account.schoolName),element("small",account.username,"student"));
+  block.append(element("span",accountLabel(account).slice(0,1),"account-avatar"));
+  const info=element("div");info.append(element("b",accountLabel(account)),element("small",account.schoolName),element("small",account.username,"student"));
   if(account.authorization_until)info.append(element("small","有效至 "+new Date(account.authorization_until).toLocaleString(),"grant-expiry"));
   block.append(info);return block;
 }
@@ -124,7 +126,7 @@ function accountActions(account,mobile=false) {
 function renderAccounts() {
   const query=$("accountSearch").value.trim().toLocaleLowerCase();
   const visible=accounts.filter(account=>(filter==="all"||(filter==="paused"?account.paused:!account.paused))&&
-    [account.name,account.schoolName,account.username].some(value=>String(value).toLocaleLowerCase().includes(query)));
+    [account.name,account.displayName,account.schoolName,account.username].some(value=>String(value).toLocaleLowerCase().includes(query)));
   $("listCount").textContent=String(accounts.length);$("accountRows").replaceChildren();$("accountCards").replaceChildren();
   $("accountEmpty").hidden=visible.length>0;
   $("accountEmpty").querySelector("h3").textContent=accounts.length?"没有匹配的账号":"还没有账号";
@@ -155,9 +157,26 @@ async function loadLogs() {
     details.append(summary,element("pre",log.detail||"无详情"));$("logList").append(details);
   }
 }
-async function refresh(updateForm=false) { await Promise.all([loadStatus(updateForm),loadAccounts(),loadLogs(),loadCodeBatches()]); }
+async function loadEnrollments(){
+  const data=await api("/api/redemption/attempts");if(!signedIn)return;
+  $("enrollmentList").replaceChildren();$("enrollmentEmpty").hidden=data.attempts.length>0;
+  const states={pending:"等待验证",verifying:"验证中",ready:"正在保存",succeeded:"已开通",failed:"未开通"};
+  const stages={request:"上游请求",tenant_list:"获取学校列表",tenant_info:"获取学校信息",portal:"打开校园入口及跳转",login_form:"解析学校登录页",login_ticket:"获取登录票据",captcha_check:"检查验证码",login_submit:"提交学校登录",login_callback:"登录回跳",setup:"准备或保存账号"};
+  const kinds={timeout:"单次请求超时",total_timeout:"总网络时限已到",transport:"连接或读取失败（DNS / TLS / 网络中断待核实）",http:"上游HTTP异常",response:"响应或登录校验未通过",request_limit:"请求次数超限",redirect_limit:"重定向次数超限",policy:"地址或跨域请求不符合安全规则",internal:"内部处理异常"};
+  for(const attempt of data.attempts){
+    const item=element("details",undefined,"log-entry"),summary=element("summary"),info=element("div",undefined,"log-text");
+    info.append(element("b","兑换码 …"+attempt.suffix),element("small",attempt.createdAt+"（"+attempt.timezone+"）"));
+    summary.append(info,badge(states[attempt.status]||attempt.status,attempt.status==="failed"?"bad":attempt.status==="succeeded"?"ok":"warn"));item.append(summary);
+    const d=attempt.diagnostic,lines=[attempt.message||states[attempt.status]||attempt.status];
+    if(d){lines.push("阶段："+(stages[d.stage]||"未知"),"分类："+(kinds[d.kind]||"未知"));if(d.host)lines.push("目标域名："+d.host);if(d.method)lines.push("方法："+d.method);if(d.httpStatus)lines.push("HTTP："+d.httpStatus);if(d.elapsedMs!=null)lines.push("请求耗时："+d.elapsedMs+" ms");}
+    else if(attempt.status==="failed")lines.push("没有详细诊断；旧版本记录或验证已被撤销/中断。");
+    item.append(element("pre",lines.join("\n")));$("enrollmentList").append(item);
+  }
+}
+$("refreshEnrollments").addEventListener("click",async()=>{const button=$("refreshEnrollments");button.disabled=true;try{await loadEnrollments();}catch(error){showError(error);}finally{button.disabled=false;}});
+async function refresh(updateForm=false) { await Promise.all([loadStatus(updateForm),loadAccounts(),loadLogs(),loadCodeBatches(),loadEnrollments()]); }
 async function togglePaused(account) {
-  if(!account.paused&&!await confirmAction("暂停此账号？",`暂停「${account.name}」后，定时、批量和手动签到都将停止。已经发送的签到请求无法撤回。`,"暂停账号"))return;
+  if(!account.paused&&!await confirmAction("暂停此账号？",`暂停「${accountLabel(account)}」（${account.username}）后，定时、批量和手动签到都将停止。已经发送的签到请求无法撤回。`,"暂停账号"))return;
   const result=await api(`/api/accounts/${encodeURIComponent(account.name)}/pause`,"POST",{paused:!account.paused});
   toast(result.paused?"账号已暂停":"账号已恢复，不补跑暂停期间的任务");
   if(result.inFlight){$("pageError").textContent="当前任务可能已进入提交阶段，无法撤回；请查看最终结果。";$("pageError").hidden=false;}
@@ -165,10 +184,10 @@ async function togglePaused(account) {
 }
 async function removeAccount(account) {
   const note=account.source==="redemption"?"该兑换账号的凭据、设备绑定与关联记录将被删除，兑换码不会恢复可用。":"账号配置将删除，设备绑定仍会保留。";
-  if(!await confirmAction("删除账号？",`删除「${account.name}」？${note}此操作不能撤销。`,"删除账号",true))return;
+  if(!await confirmAction("删除账号？",`删除「${accountLabel(account)}」（${account.username}）？${note}此操作不能撤销。`,"删除账号",true))return;
   await api("/api/accounts/"+encodeURIComponent(account.name),"DELETE");toast("账号已删除");await refresh();
 }
-function persistTasks() { sessionStorage.setItem(pendingKey,JSON.stringify([...pending.values()].map(({ids,mode,label})=>({ids,mode,label})))); }
+function persistTasks() { sessionStorage.setItem(pendingKey,JSON.stringify([...pending.values()].map(({ids,mode})=>({ids,mode,label:(modes[mode]||"任务")+" · "+ids.length+"个账号"})))); }
 function trackTask(ids,mode,label,resolve,reject) {
   const key=ids.join(",");pending.set(key,{ids,mode,label,resolve,reject});visibleTaskKey=key;persistTasks();
   $("taskResult").hidden=false;$("taskTitle").textContent=label;$("taskDetail").textContent="任务已提交，等待执行…";
@@ -179,8 +198,9 @@ async function runTask(path,mode,label) {
   return new Promise((resolve,reject)=>{trackTask(result.ids,mode,label,resolve,reject);pollJobs();});
 }
 async function runAccount(name,mode) {
-  if(mode==="submit"&&!await confirmAction("确认签到？",`将对「${name}」执行真实签到。请确认位置及账号配置正确。`,"开始签到"))return;
-  return runTask(`/api/accounts/${encodeURIComponent(name)}/run`,mode,`${modes[mode]} · ${name}`);
+  const account=accounts.find(item=>item.name===name),label=accountName(name);
+  if(mode==="submit"&&!await confirmAction("确认签到？",`将对「${label}」（${account?.username||name}）执行真实签到。请确认位置及账号配置正确。`,"开始签到"))return;
+  return runTask(`/api/accounts/${encodeURIComponent(name)}/run`,mode,`${modes[mode]} · ${label}`);
 }
 async function pollJobs() {
   if(!signedIn||pollBusy||!pending.size)return;
@@ -198,7 +218,7 @@ async function pollJobs() {
       const done=jobs.filter(job=>job.status==="done").length;
       if(key===visibleTaskKey) {
         $("taskTitle").textContent=task.label+(done===jobs.length?" · 已完成":` · ${done}/${jobs.length}`);
-        $("taskDetail").textContent=jobs.map(job=>`${job.account}：${job.status==="done"?(labels[job.result?.status]||"已完成"):job.status==="running"?"执行中":"等待执行"}\n${job.result?.detail||job.result?.message||""}`).join("\n\n");
+        $("taskDetail").textContent=jobs.map(job=>`${accountName(job.account)}：${job.status==="done"?(labels[job.result?.status]||"已完成"):job.status==="running"?"执行中":"等待执行"}\n${job.result?.detail||job.result?.message||""}`).join("\n\n");
       }
       if(done===jobs.length){pending.delete(key);persistTasks();task.resolve?.(jobs);await Promise.all([loadLogs(),loadAccounts(),loadStatus()]);}
     }
@@ -212,15 +232,17 @@ async function pollJobs() {
 function field(name) { return $("accountForm").elements.namedItem(name); }
 async function openAccount(name="") {
   editingName=name;originalDevice="";$("accountForm").reset();$("accountFormError").hidden=true;
-  $("accountDialogTitle").textContent=name?"编辑账号 · "+name:"新增账号";
-  field("name").disabled=Boolean(name);field("password").required=!name;
+  $("accountDialogTitle").textContent=name?"编辑账号 · "+accountName(name):"新增账号";
+  field("name").disabled=false;field("name").maxLength=name?50:32;field("password").required=!name;
+  $("accountNameNote").textContent=name?"此名称仅用于显示，修改不会改变账号内部编号或设备标识。":"新建名称用于内部标识；保存后可修改显示名称。";
   for(const id of ["testLogin","rangeButton","testNotify"])$(id).disabled=!name;
   $("rangeNote").textContent="";$("loginTestState").textContent="";$("notifyTestState").textContent="测试使用已保存的配置，不会执行签到。";
-  $("accountSaveHint").textContent=name?"密码留空保持不变。":"请填写手机原绑定 deviceId。";
+  $("accountSaveHint").textContent=name?"密码和设备标识留空保持不变。":"设备标识留空自动处理，保存后固定使用。";
   $("accountDialog").querySelector(".advanced-fields").open=false;
   if(name){
     const account=await api("/api/accounts/"+encodeURIComponent(name));if(!signedIn)return;
     for(const key of ["name","schoolName","type","username","deviceId","lon","lat","address","abnormalReason","checkTitle","httpProxy"])field(key).value=account[key]??"";
+    field("name").value=accountLabel(account);
     field("notifyMethod").value=String(account.notify_method||0);field("notifyRcv").value=account.notify_rcv||"";originalDevice=account.deviceId;
   }
   $("accountDialog").showModal();
@@ -230,7 +252,8 @@ $("accountForm").addEventListener("submit",async event=>{
   event.preventDefault();const submit=$("saveAccount");submit.disabled=true;$("accountFormError").hidden=true;
   try{
     const body=Object.fromEntries(new FormData(event.currentTarget));
-    if(editingName&&body.deviceId!==originalDevice&&!await confirmAction("修改设备绑定？","仅在修正为手机真实绑定ID时继续。随意更换可能触发学校的设备限制。","确认修改"))return;
+    if(editingName&&body.deviceId.trim()&&body.deviceId.trim()!==originalDevice&&!await confirmAction("修改设备标识？","只在需要迁移或修正原ID时修改。留空会保持原值，随意更换可能触发学校的设备限制。","确认修改"))return;
+    if(editingName){body.displayName=body.name;delete body.name;}
     await api(editingName?"/api/accounts/"+encodeURIComponent(editingName):"/api/accounts","POST",body);
     closeAccount();toast("账号已保存");await refresh();
   }catch(error){showError(error);}finally{submit.disabled=false;}
@@ -239,7 +262,7 @@ async function editorTask(buttonId,mode,suffix,stateId) {
   const name=editingName;if(!name)return;
   $(buttonId).disabled=true;$(stateId).textContent="正在执行…";
   try{
-    const jobs=await runTask(`/api/accounts/${encodeURIComponent(name)}/${suffix}`,mode,`${modes[mode]} · ${name}`);
+    const jobs=await runTask(`/api/accounts/${encodeURIComponent(name)}/${suffix}`,mode,`${modes[mode]} · ${accountName(name)}`);
     if(editingName!==name||!$("accountDialog").open||!jobs.length)return;
     const result=jobs[0].result;$(stateId).textContent=result.message;
     if(mode==="range"&&result.status==="success"){
@@ -336,7 +359,7 @@ for(const button of document.querySelectorAll("[data-filter]"))button.addEventLi
 $("accountSchool").addEventListener("input",event=>{const query=event.target.value.trim();$("schoolOptions").replaceChildren();if(query)for(const name of (window.SCHOOL_LIST||[]).filter(value=>value.includes(query)).slice(0,30)){const option=element("option");option.value=name;$("schoolOptions").append(option);}});
 $("dismissResult").addEventListener("click",()=>$("taskResult").hidden=true);
 setInterval(()=>{if(signedIn&&!document.hidden)pollJobs();},3000);
-setInterval(()=>{if(signedIn&&!document.hidden)Promise.all([loadStatus(),loadLogs(),loadAccounts(),loadCodeBatches()]).catch(showError);},60000);
+setInterval(()=>{if(signedIn&&!document.hidden)Promise.all([loadStatus(),loadLogs(),loadAccounts(),loadCodeBatches(),loadEnrollments()]).catch(showError);},60000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&signedIn)pollJobs();});
 (async()=>{
   try { localStorage.removeItem("jrxy_web_token");localStorage.removeItem("jrxy_cf_token"); } catch {}

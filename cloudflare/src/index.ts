@@ -7,7 +7,7 @@ import { dispatch, enqueue, jobView, processJob } from "./jobs";
 import { localTime, scheduleView, tick, updateSchedule } from "./scheduler";
 import { extractDeviceId } from "./engine/device";
 import { settings } from "./config";
-import { createCodeBatch, listCodeBatches, revokeCode, publicRedemption, processEnrollment } from "./redemption";
+import { createCodeBatch, listCodeBatches, listEnrollments, revokeCode, publicRedemption, processEnrollment } from "./redemption";
 import { cleanupExpiredAccounts } from "./expiry";
 
 const json = (data: unknown, status = 200): Response => Response.json(data, { status, headers: {
@@ -23,6 +23,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   const identity=await authorize(request,env);
   if(path==="/api/auth/session" && method==="GET")return json(identity);
   if(path==="/api/redemption/batches" && method==="GET")return json(await listCodeBatches(env));
+  if(path==="/api/redemption/attempts" && method==="GET")return json({attempts:await listEnrollments(env)});
   if(path==="/api/redemption/batches" && method==="POST")return json(await createCodeBatch(env,await readJson(request)),201);
   const revoke=/^\/api\/redemption\/codes\/([A-Za-z0-9-]+)\/revoke$/.exec(path);
   if(revoke && method==="POST"){await revokeCode(env,revoke[1]);return json({ok:true});}
