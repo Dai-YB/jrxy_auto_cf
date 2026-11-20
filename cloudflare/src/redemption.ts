@@ -24,7 +24,8 @@ const ATTEMPT_MS=10*60_000;
 const messages:Record<string,string>={
   invalid:"兑换码无效或不可用",used:"兑换码已使用，不能再次兑换",expired:"兑换码已过最晚兑换时间",revoked:"兑换码已撤销",
   busy:"兑换码正在验证，请等待当前操作完成",credentials:"学校登录未通过，请核对账号密码或联系管理员查看诊断；本次未开通且未消耗兑换码",captcha:"学校登录需要人工验证，本次未开通且未消耗兑换码",
-  network:"登录验证链路连接失败，请联系管理员查看诊断；本次未开通且未消耗兑换码",
+  network:"登录验证请求未取得响应，请联系管理员查看诊断；本次未开通且未消耗兑换码",
+  response_read:"登录验证已收到响应但正文读取失败，请联系管理员查看诊断；本次未开通且未消耗兑换码",
   timeout:"登录验证链路请求超时，请联系管理员查看诊断；本次未开通且未消耗兑换码",
   upstream:"登录验证接口返回异常状态，请联系管理员查看诊断；本次未开通且未消耗兑换码",
   protocol:"登录验证响应或协议不兼容，请联系管理员查看诊断；本次未开通且未消耗兑换码",
@@ -265,8 +266,8 @@ export async function processEnrollment(env:Env,id:string,loginFn=login):Promise
       const diagnostic=safeDiagnostic(error instanceof EngineError?error.diagnostic:{stage:"setup",kind:"internal"},privateValues);
       const kind=diagnostic?.kind;
       const reason=error instanceof EngineError?(error.status==="captcha"?"captcha":error.status==="unsupported"?"unsupported":
-        kind==="timeout"||kind==="total_timeout"?"timeout":kind==="http"?"upstream":kind==="transport"||error.retryable?"network":
-        error.status==="error"||["policy","request_limit","redirect_limit","internal"].includes(kind??"")?"protocol":"credentials"):"unknown";
+        kind==="timeout"||kind==="total_timeout"?"timeout":kind==="http"?"upstream":kind==="body_read"?"response_read":kind==="transport"?"network":
+        error.status==="error"||["policy","request_limit","redirect_limit","internal","response_processing"].includes(kind??"")?"protocol":"credentials"):"unknown";
       await failAttempt(env,id,reason,diagnostic);return;
     }
   }

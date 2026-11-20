@@ -91,7 +91,7 @@ async function runExecution(account: Account, deviceId: string, mode: Mode, opti
   catch { return { status: "fail", message: "已保存的 deviceId 缺失或格式无效，未发起登录；请检查账号设备配置" }; }
   try {
     trace.push("步骤 1/5 登录（使用已保存的固定设备标识）");
-    const auth = await (options.loginFn ?? login)(account,new Session(fetch,options.httpTimeoutMs,options.runTimeoutMs));
+    const auth = await (options.loginFn ?? login)(account,new Session(fetch,options.httpTimeoutMs,options.runTimeoutMs),mode);
     trace.push("登录成功；Cookie 与会话令牌不写入日志");
     if(mode === "login")return {status:"success",message:"登录成功",data:{host:auth.host,cookies:auth.session.jar.names()}};
     const api = paths(account.type);
@@ -131,7 +131,7 @@ async function runExecution(account: Account, deviceId: string, mode: Mode, opti
         lon: account.lon, lat: account.lat, version: "first_v4", calVersion: "firstv", deviceId, userId: account.username,
         systemName: "iOS", systemVersion: "18.2", model: "iPhone 16 Pro", appVersion: "9.9.22", ...encrypted
       }, { "User-Agent":IOS_UA, deviceType: "2", CpdailyClientType: "CPDAILY", Accept: "*/*", CacheTimeValue: "0", sessionTokenKey: auth.sessionToken,
-        "Accept-Language": "zh-Hans-CN", tenantId: auth.tenantId, CpdailyStandAlone: "0", Cookie: cookie.join("; ") });
+        "Accept-Language": "zh-Hans-CN", tenantId: auth.tenantId, CpdailyStandAlone: "0", Cookie: cookie.join("; ") },{timeoutMs:20000,ascii:false});
       const message = String(result.message ?? "").slice(0, 200);
       if (message === "SUCCESS") return { status: "success", message: "签到成功" };
       if (/已签|重复/.test(message)) return { status: "already", message: "上游确认已签到" };

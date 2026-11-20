@@ -1,7 +1,8 @@
 // 登录流程适配自 jrxy-engine/actions/{wiseLoginService,casLogin,iapLogin}.py（MPL-2.0）。
-import { type Account, EngineError } from "../types";
+import { type Account, type Mode, EngineError } from "../types";
 import { aes, randomLoginPrefix } from "./crypto";
 import { publicUrl, Session } from "./http";
+import { formEncode } from "./encoding";
 
 interface Tenant { id: string; joinType: string; campus: string; }
 function campusHost(host: string): boolean { return ["campusphere.net","campushoy.com"].some(domain=>host===domain||host.endsWith("."+domain)); }
@@ -19,47 +20,45 @@ export async function parseForm(html: string): Promise<{ form: string; inputs: I
   const inputs: Input[] = [];
   const known = ["casLoginForm", "pwdFromId", "loginFromId", "fm1"];
   const counts = new Map<string,number>();
-  const scan = new HTMLRewriter().on("form", { element(el) {
+  const scan = new HTMLRewriter().on("[id]", { element(el) {
     const id = el.getAttribute("id") ?? "";
     if (known.includes(id)) counts.set(id,(counts.get(id)??0)+1);
   } });
   await scan.transform(new Response(html)).text();
   form = known.find(id => counts.has(id)) ?? "";
   if (!form) throw new EngineError("未识别学校登录表单，可能需要人工验证或专用适配", "unsupported");
-  // 原loginFromId模板取第二个同名表单；其他模板只取第一个，不能混合各表单的令牌。
-  const selected = form === "loginFromId" && counts.get(form)! > 1 ? 1 : 0;
-  let current = -1;
-  await new HTMLRewriter().on(`form[id="${form}"]`,{element(){current++;}})
-    .on(`form[id="${form}"] input`, { element(el) {
-      if(current===selected)inputs.push({ name: el.getAttribute("name") ?? "", id: el.getAttribute("id") ?? "", value: decodeAttribute(el.getAttribute("value") ?? "") });
-    } }).transform(new Response(html)).text();
-  // 少数模板将盐放在表单外。
-  await new HTMLRewriter().on("input[id=\"pwdEncryptSalt\"], input[id=\"pwdDefaultEncryptSalt\"]", { element(el) {
-    if (!inputs.some(i => i.id === el.getAttribute("id"))) inputs.push({ name: "", id: el.getAttribute("id")!, value: decodeAttribute(el.getAttribute("value") ?? "") });
-  } }).transform(new Response(html)).text();
+  // 原casLoginForm收集整页输入，另外两种模板限制在指定表单内。
+  const selected=form==="loginFromId"?1:0;
+  if(form==="loginFromId"&&counts.get(form)!<2)throw new EngineError("学校登录页缺少原版要求的第二个loginFromId表单","unsupported");
+  let current=-1;
+  const parser=new HTMLRewriter().on(`[id="${form}"]`,{element(){current++;}})
+    .on(form==="casLoginForm"?"input":`[id="${form}"] input`,{element(el){
+      if(form==="casLoginForm"||current===selected)inputs.push({name:el.getAttribute("name")??"",id:el.getAttribute("id")??"",value:decodeAttribute(el.getAttribute("value")??"")});
+    }});
+  await parser.transform(new Response(html)).text();
   return { form, inputs };
 }
+async function tenantItem(session: Session, name: string): Promise<{id:string;joinType:string}> {
+  const list=await session.at("tenant_list").json("https://mobile.campushoy.com/v6/config/guest/tenant/list");
+  const item=Array.isArray(list.data)?list.data.find((school:any)=>school.name===name):null;
+  if(!item||item.joinType==="NONE")throw new EngineError("学校不存在或未接入jrxy");
+  return item;
+}
+async function discover(session: Session, name: string) {
+  const tenant=await tenantFor(session,name);
+  const landing=await session.at("portal").request(tenant.campus);
+  return {tenant,landing};
+}
 async function tenantFor(session: Session, name: string): Promise<Tenant> {
-  session.at("tenant_list");
-  const cacheUrl = "https://jrxy-metadata.invalid/tenant/" + encodeURIComponent(name);
-  const cached = await caches.default.match(cacheUrl);
-  if (cached) return cached.json<Tenant>();
-  const listUrl = "https://mobile.campushoy.com/v6/config/guest/tenant/list";
-  const cachedList = await caches.default.match(listUrl);
-  const list = cachedList ? await cachedList.json<any>() : await session.at("tenant_list").json(listUrl);
-  if (!cachedList) await caches.default.put(listUrl,Response.json(list,{headers:{"Cache-Control":"max-age=3600"}}));
-  const item = list.data?.find((s: any) => s.name === name);
-  if (!item || item.joinType === "NONE") throw new EngineError("学校不存在或未接入jrxy");
-  const info = await session.at("tenant_info").json("https://mobile.campushoy.com/v6/config/guest/tenant/info?ids=" + encodeURIComponent(item.id));
+  const item=await tenantItem(session,name);
+  const info = await session.at("tenant_info").json("https://mobile.campushoy.com/v6/config/guest/tenant/info?" + formEncode([["ids",String(item.id)]]));
   const school = info.data?.[0];
   const campus = [school?.ampUrl, school?.ampUrl2].find(v => {
     if (typeof v !== "string") return false;
     try { const u = publicUrl(v); return campusHost(u.hostname); } catch { return false; }
   });
   if (!campus) throw new EngineError("没有找到受支持的学校客户端地址", "unsupported");
-  const tenant = { id: String(item.id), joinType: String(school.joinType), campus };
-  await caches.default.put(cacheUrl, Response.json(tenant, { headers: { "Cache-Control": "max-age=3600" } }));
-  return tenant;
+  return { id: String(item.id), joinType: String(school.joinType), campus };
 }
 async function loginError(html: string): Promise<string> {
   const messages: Record<string,string> = {};
@@ -68,8 +67,9 @@ async function loginError(html: string): Promise<string> {
   await parser.transform(new Response(html)).text();
   return ["errorMsg","formErrorTip2","msg"].map(id => decodeAttribute(messages[id]??"").trim()).find(Boolean)?.slice(0,200) || "学校登录失败，请检查密码或人工验证状态";
 }
-async function cas(session: Session, account: Account, url: string, html: string): Promise<void> {
-  session.at("login_form");
+async function cas(session: Session, account: Account, url: string): Promise<void> {
+  const page=await session.at("login_form").request(url);
+  const html=page.text;
   const { form, inputs } = await parseForm(html);
   if (form === "fm1") throw new EngineError("此学校 RSA 登录分支要求验证码，请人工登录", "captcha");
   const params = new URLSearchParams();
@@ -90,7 +90,7 @@ async function cas(session: Session, account: Account, url: string, html: string
     catch { throw new EngineError("无法判断验证码状态，请人工检查登录页", "captcha"); }
   }
   if (captcha) throw new EngineError("登录需要验证码，自动任务已停止，请人工处理", "captcha");
-  const response = await session.at("login_submit").request(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: params.toString() }, false);
+  const response = await session.at("login_submit").request(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: formEncode(params) }, false);
   if (response.status !== 302 || !response.headers.get("location")) throw new EngineError(await loginError(response.text));
   const landed = await session.at("login_callback").request(new URL(response.headers.get("location")!, url).href, {method:"POST"});
   if (landed.status<200 || landed.status>=300 || !campusHost(new URL(landed.url).hostname))
@@ -98,12 +98,12 @@ async function cas(session: Session, account: Account, url: string, html: string
 }
 async function iap(session: Session, account: Account, url: string): Promise<void> {
   const root = new URL(url).origin + "/";
-  const lt = await session.at("login_ticket").json(root + "iap/security/lt", {});
+  const lt = session.parseJson(await session.at("login_ticket").request(root + "iap/security/lt", {method:"POST",body:"{}"}));
   if (!lt.result?._lt) throw new EngineError("未取得 IAP 登录票据", "unsupported");
-  const need = await session.at("captcha_check").json(root + "iap/checkNeedCaptcha?username=" + encodeURIComponent(account.username), {});
+  const need = session.parseJson(await session.at("captcha_check").request(root + "iap/checkNeedCaptcha?username=" + encodeURIComponent(account.username), {method:"POST",body:"{}"}));
   if (need.needCaptcha !== false) throw new EngineError("登录需要验证码，自动任务已停止，请人工处理", "captcha");
   const params = new URLSearchParams({ lt: lt.result._lt, rememberMe: "false", dllt: "", mobile: "", username: account.username, password: account.password, captcha: "" });
-  const response = await session.at("login_submit").request(root + "iap/doLogin?" + params, { method: "POST" }, false);
+  const response = await session.at("login_submit").request(root + "iap/doLogin?" + formEncode(params), { method: "POST" }, false);
   if (response.status !== 302 || !response.headers.get("location")) {
     let code = "";
     try { code = String(JSON.parse(response.text).resultCode ?? ""); } catch {}
@@ -115,22 +115,22 @@ async function iap(session: Session, account: Account, url: string): Promise<voi
     throw new EngineError("IAP登录未完成，尚未返回受支持的校园门户");
 }
 export interface Login { session: Session; host: string; tenantId: string; sessionToken: string; }
-export async function login(account: Account, session = new Session()): Promise<Login> {
+export async function login(account: Account, session = new Session(), mode: Mode = "login"): Promise<Login> {
   try {
     if (account.httpProxy) throw new EngineError("已保留原 HTTP 代理配置，但纯 Workers 尚无等价 requests 代理适配；不会忽略代理直连，请先确认部署架构", "unsupported");
-    const tenant = await tenantFor(session, account.schoolName);
+    const submission=mode==="dry"||mode==="submit";
+    if(submission)await discover(session,account.schoolName);
+    const {tenant,landing}=await discover(session,account.schoolName);
     const host = new URL(tenant.campus).origin + "/";
-    const landing = await session.at("portal").request(tenant.campus);
     const service = new URL(landing.url).searchParams.get("service");
     let sessionToken = "";
     if (service) { try { sessionToken = new URL(service).searchParams.get("sessionToken") ?? ""; } catch {} }
-    if (!session.jar.get("MOD_AUTH_CAS", host)) {
-      if (tenant.joinType === "CLOUD") await iap(session, account, landing.url);
-      else await cas(session, account, landing.url, landing.text);
-    }
+    if (tenant.joinType === "CLOUD") await iap(session, account, landing.url);
+    else await cas(session, account, landing.url);
     if (!session.jar.names().length) throw new EngineError("登录跳转未获得会话 Cookie，无法确认登录成功");
+    const tenantId=submission?String((await tenantItem(session,account.schoolName)).id):tenant.id;
     session.at("request");
-    return { session, host, tenantId: tenant.id, sessionToken: sessionToken || session.jar.get("sessionToken", host) };
+    return { session, host, tenantId, sessionToken: sessionToken || session.jar.get("sessionToken", host) };
   } catch (error) {
     if(error instanceof EngineError){error.diagnostic??=session.diagnostic("response");throw error;}
     throw new EngineError("登录处理异常，请检查协议兼容性","error",false,session.diagnostic("internal"));

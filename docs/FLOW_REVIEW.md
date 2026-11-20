@@ -14,9 +14,9 @@
 |---|---|---|
 | 管理鉴权 | 原WEB_TOKEN | 按新需求改为独立账号密码、会话摘要、HttpOnly Cookie、Origin/CSRF、限速；旧token拒绝 |
 | 账号与设备 | 原YAML/device_id | D1加密账号及姓名；两个入口先自动沿用/生成并保存固定ID，手动迁移ID可选；编辑留空沿用，不因显示名称修改重建内部ID |
-| 学校发现 | wiseLoginService | 保留租户查询、CLOUD分流，缓存公开元数据；不缓存账号会话 |
-| CAS表单 | casLogin | 优先级、隐藏字段、密码盐、验证码判断、POST换票；补齐第二个loginFromId表单选择，避免混合令牌 |
-| IAP登录 | iapLogin | 保留lt与原参数契约；必须返回校园门户，不能把仅有登录页Cookie误判为成功 |
+| 学校发现 | wiseLoginService | 按原入口次数执行，不再缓存并跳过请求；登录/范围一轮发现，探测/签到两轮发现，后者登录后再次查租户 |
+| CAS表单 | casLogin | 发现后重新GET登录页；casLoginForm整页输入、pwdFromId首个/ loginFromId第二个表单；新Cookie/令牌、Python表单编码及盐加密一致 |
+| IAP登录 | iapLogin | 原lt/验证码请求使用无Content-Type的{}正文；doLogin为POST查询参数、回跳POST；额外保留校园门户成功校验 |
 | Cookie/跳转 | requests.Session | 合法父域Cookie、公共后缀隔离、跳转限制；不跨域重放登录请求体 |
 | 登录测试 | test_login | 仅登录，返回host/Cookie名称，不查询任务，不回传Cookie值 |
 | 任务列表 | AutoSign.getUnSignTask | 查询预热、未签/请假回退、标题匹配；异常列表结构停止，不当成成功或无任务 |
@@ -31,11 +31,26 @@
 | 通知 | send_notify/run_and_report | 原Server酱/Webhook契约、标题/时间/触发、探测开关、最终重试通知；服务受理不等于终端送达 |
 | UI | 新需求 | 原生响应式管理台，暂停与真实提交确认，学校密码不回显；不保存旧访问token |
 | 兑换开通 | 新增用户授权 | 先生成/沿用ID并保存到短期记录，再调用原登录函数验证，成功后事务绑定唯一兑换码；失败清除姓名、密码及临时设备标识，不以生成ID冒充学校授权 |
-| 开通诊断 | 新增排障 | 结构化记录阶段/方法/域名/耗时/HTTP状态，不包含完整URL、原始异常、Cookie与请求内容，管理鉴权且短期清理 |
+| 开通诊断 | 新增排障 | 结构化记录阶段/方法/域名/耗时/HTTP状态及send/headers/body/decode/json环节；区分未获响应、正文中断、响应处理异常；不包含原始异常与个人请求内容 |
 | 到期清理 | 新增授权期限 | 任务建立/消费/提交/结果写入均校验；删除兑换账号及个人记录，保留码已用摘要，旧任务不可重建个人数据 |
 | 发布 | Git连接Cloudflare | 同一代码/配置，检查→增量迁移→发布；预览dry-run不连接生产库 |
 
 ## 本次审查修复
+
+### 请求轨迹复核
+
+此前133项通过覆盖业务规则与模拟流程，未证明完整HTTP请求链路一致。本轮先从原Python入口捕获16条合成轨迹，修复前16条均不匹配，修复后全部通过：
+
+- 原 `test_login.py` / `fetch_sign_range.py` 一轮学校发现；原 `merged_ios_v4_submit.py` 调用发现两次，登录后还查询一次租户。Worker已恢复这些顺序，不再用学校元数据缓存跳过请求。
+- CAS发现登录地址后再次GET登录页，使用最新Cookie、execution和密码盐；`casLoginForm`整页字段与其他模板的限定范围分开处理。
+- 表单使用Python urlencode规则（包括`~`、`*`等字符）、登录AES串按原76列换行；IAP的`{}`正文不擅自添加JSON或text/plain类型。
+- 请求JSON的空格及ASCII转义匹配原调用方式；动态密钥和提交按原显式20秒请求时限；原段值非空检查保留。Workers整体计时语义仍不同于requests读超时，见下文。
+- 空Cookie头不发送；标准getSetCookie和Workers getAll兼容，多个Cookie及Expires逗号不合并拆错。响应头/正文处理异常不再伪装成连接失败。
+- `original-http.test.ts` 比较16条轨迹的应用层方法、URL、显式请求头、正文和Cookie。固定随机输入后对齐签名及加密头；RSA随机填充只校验结构，不逐字比较。另测同学校不同账号不共享Cookie或跳过发现。
+
+轨迹生成只执行AST提取的原函数，requests使用内存适配器且socket连接被禁用；不导入原Web服务器、不读取账号目录。传输层自动添加的Content-Length、压缩/连接头以及TLS握手不在逐字对照范围内。
+
+### 既有审查修复
 
 - 重复 `loginFromId` 表单不再把不同表单隐藏字段混在一起，选取与原模板对应的第二个。
 - IAP跳回登录页时不再仅凭预登录Cookie误报成功。
@@ -51,7 +66,7 @@
 3. 后台和兑换账号统一按原Web `ensure_device_id()` 规则，登录/探测前先沿用可确认绑定，无值时首次生成UUID并固定。管理员可选填旧ID，编辑留空保持原值。原独立 `test_login.py` 仅做CAS/IAP登录，ID参与后续动态密钥协商和签到；不为登录接口臆造设备字段，也不能凭生成ID保证学校设备授权。
 4. 不使用OCR，不上传照片，不提供类型0/3/4任务；触发验证码停止并报告。
 5. 仅支持公网HTTPS和有效TLS证书，不照搬 `verify=False`；本机HTTP代理不适用于云端。
-6. 查询/提交设置超时、大小和跳转上限；免费配额可能导致任务中断，需看远程Metrics。
+6. 原requests默认连接10秒/读取30秒，协商与提交显式20秒；Workers将显式20秒应用于完整请求，并保留总时限、大小和跳转上限。原requests仅对未建立连接的失败有限重试，Workers不对送达情况不明的fetch异常重放POST。免费配额及出口/TLS差异仍需远程Metrics和同次脱敏诊断核实。
 7. 外部推送没有端到端幂等键，发送期间崩溃可能未知；不会把未知写成成功。
 8. 运行API异步返回任务ID，页面内部轮询；直接调用旧同步API的脚本需要适配。
 9. 新安装尚无授权时定时默认关闭；首次成功兑换可开启未由管理员设置过的初始计划。主动关闭/保存过的计划不覆盖，兑换账号只参与开通后的计划，不立即签到或补跑。
@@ -60,6 +75,7 @@
 ## 验证证据
 
 - `original-parity.test.ts`：任务选择、表单、Python签名材料与结果分类。
+- `original-http.test.ts`：16条原Python入口轨迹及跨账号无缓存/无会话共享测试，覆盖请求序列、headers、body、Cookie及固定输入下的加密输出。
 - `login.test.ts`：CAS/IAP、重复表单、Cookie与错误状态。
 - `engine.test.ts` / `crypto-runtime.test.ts`：加密、任务、探测、提交异常复查。
 - `end-to-end.test.ts`：管理API→队列→模拟上游→提交/不提交→通知与日志。

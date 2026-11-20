@@ -115,7 +115,8 @@ export class AppError extends Error {
 export type RequestStage = "request" | "tenant_list" | "tenant_info" | "portal" | "login_form" | "login_ticket" | "captcha_check" | "login_submit" | "login_callback" | "setup";
 export interface RequestDiagnostic {
   stage: RequestStage;
-  kind: "timeout" | "total_timeout" | "transport" | "http" | "response" | "request_limit" | "redirect_limit" | "policy" | "internal";
+  kind: "timeout" | "total_timeout" | "transport" | "body_read" | "response_processing" | "http" | "response" | "request_limit" | "redirect_limit" | "policy" | "internal";
+  phase?: "send" | "headers" | "body" | "decode" | "json";
   host?: string;
   method?: "GET" | "POST" | "HEAD";
   httpStatus?: number;

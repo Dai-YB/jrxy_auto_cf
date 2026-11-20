@@ -1,5 +1,6 @@
 import { EngineError, type RequestDiagnostic, type RequestStage } from "../types";
 import { getDomain } from "tldts";
+import { pythonJson } from "./encoding";
 
 export const LOGIN_UA = "Mozilla/5.0 (Linux; Android 8.0.0; MI 6 Build/OPR1.170623.027; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/92.0.4515.131 Mobile Safari/537.36 okhttp/3.12.4";
 export const IOS_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 cpdaily/9.9.22 wisedu/9.9.22";
@@ -54,6 +55,12 @@ export class CookieJar {
     return pair?.slice(name.length + 1) ?? "";
   }
 }
+export function responseCookies(headers: Headers): string[] {
+  if(typeof headers.getSetCookie==="function")return headers.getSetCookie();
+  if(typeof headers.getAll==="function")return headers.getAll("Set-Cookie");
+  if(!headers.has("Set-Cookie"))return [];
+  throw new Error("Runtime does not support separate Set-Cookie values");
+}
 export interface HttpResult { status: number; url: string; headers: Headers; text: string; }
 export class Session {
   readonly jar = new CookieJar();
@@ -69,7 +76,7 @@ export class Session {
   private failure(message: string, kind: RequestDiagnostic["kind"], retryable = false): EngineError {
     return new EngineError(message,retryable?"error":"fail",retryable,this.diagnostic(kind));
   }
-  async request(input: string, options: RequestInit = {}, follow = true): Promise<HttpResult> {
+  async request(input: string, options: RequestInit = {}, follow = true, timeoutMs = this.timeoutMs): Promise<HttpResult> {
     this.last=undefined;
     let url: URL;
     try { url=publicUrl(input); }
@@ -85,15 +92,22 @@ export class Session {
       const left = this.deadline - started;
       if (left <= 0) throw this.failure("任务网络总时限已到","total_timeout",true);
       const h = new Headers(headers);
-      h.set("Cookie", this.jar.header(url));
+      const cookie=this.jar.header(url);
+      if(cookie)h.set("Cookie",cookie);else h.delete("Cookie");
       if (options.headers && new Headers(options.headers).has("Cookie") && hop === 0) h.set("Cookie", new Headers(options.headers).get("Cookie")!);
       const abort = new AbortController();
-      const timer = setTimeout(() => abort.abort(), Math.min(this.timeoutMs, left));
+      const timer = setTimeout(() => abort.abort(), Math.min(timeoutMs, left));
       let result: HttpResult;
+      let phase: NonNullable<RequestDiagnostic["phase"]>="send";
       try {
-        const response = await this.transport(url.href, { method, body, headers: h, redirect: "manual", signal: abort.signal });
+        // bytes避免fetch给原本无Content-Type的IAP字符串正文自动加text/plain。
+        const wireBody=typeof body==="string"&&!h.has("Content-Type")?new TextEncoder().encode(body):body;
+        this.last.phase=phase;
+        const response = await this.transport(url.href, { method, body:wireBody, headers: h, redirect: "manual", signal: abort.signal });
+        phase="headers";this.last.phase=phase;
         this.last.httpStatus=response.status;
-        for (const cookie of response.headers.getSetCookie()) this.jar.set(cookie, url);
+        for (const value of responseCookies(response.headers)) this.jar.set(value, url);
+        phase="body";this.last.phase=phase;
         const reader = response.body?.getReader();
         const chunks: Uint8Array[] = [];
         let size = 0;
@@ -104,6 +118,7 @@ export class Session {
           if (size > 2 * 1024 * 1024) { await reader.cancel(); throw new EngineError("上游响应过大"); }
           chunks.push(value);
         }
+        phase="decode";this.last.phase=phase;
         const bytes = new Uint8Array(size);
         let offset = 0;
         for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
@@ -111,8 +126,10 @@ export class Session {
       } catch (e) {
         this.last.elapsedMs=Math.max(0,Date.now()-started);
         if (e instanceof EngineError) { e.diagnostic??=this.diagnostic("response");throw e; }
-        if(abort.signal.aborted)throw this.failure("上游请求超时",left<=this.timeoutMs?"total_timeout":"timeout",true);
-        throw this.failure("上游连接或读取失败（可能涉及DNS、TLS或连接中断，尚不能确定）","transport",true);
+        if(abort.signal.aborted)throw this.failure("上游请求超时",left<=timeoutMs?"total_timeout":"timeout",true);
+        if(phase==="send")throw this.failure("发送上游请求失败，尚未取得响应（DNS、TLS或连接原因待核实）","transport",true);
+        if(phase==="body")throw this.failure("已取得响应，但读取正文失败","body_read",true);
+        throw this.failure("已取得响应，但处理响应头或内容失败；请查看管理员诊断","response_processing");
       } finally { clearTimeout(timer); }
       this.last.elapsedMs=Math.max(0,Date.now()-started);
       if (result.status === 418 || result.status === 429) throw this.failure("上游限制访问，请停止自动执行并检查账号/网络","http");
@@ -132,11 +149,15 @@ export class Session {
     }
     throw this.failure("登录重定向次数过多","redirect_limit");
   }
-  async json<T = any>(url: string, data?: unknown, headers?: HeadersInit): Promise<T> {
-    const r = await this.request(url, { method: data === undefined ? "GET" : "POST",
-      headers: { "Content-Type": "application/json", ...Object.fromEntries(new Headers(headers)) },
-      body: data === undefined ? undefined : JSON.stringify(data) });
+  parseJson<T = any>(r: HttpResult): T {
+    if(this.last)this.last.phase="json";
     if (r.status < 200 || r.status >= 300) throw this.failure(`上游返回 HTTP ${r.status}`,"http");
     try { return JSON.parse(r.text) as T; } catch { throw this.failure("上游未返回 JSON，可能登录失效或需要人工验证","response"); }
+  }
+  async json<T = any>(url: string, data?: unknown, headers?: HeadersInit, options: {timeoutMs?:number;ascii?:boolean} = {}): Promise<T> {
+    const h=new Headers(headers);
+    if(data!==undefined&&!h.has("Content-Type"))h.set("Content-Type","application/json");
+    return this.parseJson<T>(await this.request(url, { method: data === undefined ? "GET" : "POST",headers:h,
+      body: data === undefined ? undefined : pythonJson(data,options.ascii??true) },true,options.timeoutMs));
   }
 }

@@ -42,7 +42,7 @@ describe("CAS/IAP without OCR",()=>{
   });
   it.each(["casLoginForm","pwdFromId","loginFromId"])("logs in through %s and preserves hidden tokens",async(form)=>{
     const transport=mockSchool("CAS",(url,init)=>{
-      if(url.pathname==="/authserver/login"&&init.method==="GET")return new Response(`<form id="${form}"><input name="execution" value="a&amp;b"><input name="username"><input name="password"></form>`,{headers:{"Set-Cookie":"pre=session; Domain=.example.edu; Path=/"}});
+      if(url.pathname==="/authserver/login"&&init.method==="GET")return new Response((form==="loginFromId"?'<form id="loginFromId"><input name="execution" value="wrong"></form>':'')+`<form id="${form}"><input name="execution" value="a&amp;b"><input name="username"><input name="password"></form>`,{headers:{"Set-Cookie":"pre=session; Domain=.example.edu; Path=/"}});
       if(url.pathname.includes("needCaptcha"))return new Response("false");
       if(url.pathname.includes("checkNeedCaptcha"))return Response.json({isNeed:false});
       if(url.pathname==="/authserver/login"&&init.method==="POST"){
@@ -60,6 +60,23 @@ describe("CAS/IAP without OCR",()=>{
     expect(result.host).toBe("https://school.campusphere.net/");expect(result.sessionToken).toBe("synthetic-token");
     expect(result.session.jar.get("MOD_AUTH_CAS",result.host)).toBe("auth");
     expect(transport.mock.calls.some(([url])=>/generateCaptcha|getCaptcha|captcha\.html/.test(url))).toBe(false);
+  });
+  it("refreshes the CAS page and submits only the new token and cookie",async()=>{
+    let pages=0;
+    const transport=mockSchool("CAS",(url,init)=>{
+      if(url.pathname==="/authserver/login"&&init.method==="GET")return new Response(`<form id="pwdFromId"><input name="execution" value="token-${++pages}"><input name="username"><input name="password"></form>`,{headers:{"Set-Cookie":`flow=${pages}; Path=/; Secure`}});
+      if(url.pathname.includes("checkNeedCaptcha"))return Response.json({isNeed:false});
+      if(url.pathname==="/authserver/login"&&init.method==="POST"){
+        expect(new URLSearchParams(String(init.body)).get("execution")).toBe("token-2");expect(new Headers(init.headers).get("cookie")).toBe("flow=2");
+        return new Response(null,{status:302,headers:{Location:"https://school.campusphere.net/callback"}});
+      }
+      return new Response("ok",{headers:{"Set-Cookie":"MOD_AUTH_CAS=auth; Path=/"}});
+    });
+    await login(user,new Session(transport as any));expect(pages).toBe(2);
+    expect(transport.mock.calls.filter(([,init])=>init.method==="POST")).toHaveLength(2);
+  });
+  it("rejects a missing second loginFromId form instead of silently choosing another form",async()=>{
+    await expect(parseForm('<form id="loginFromId"><input name="execution" value="wrong"></form>')).rejects.toMatchObject({status:"unsupported"});
   });
   it("stops before password submission when CAPTCHA is requested",async()=>{
     const transport=mockSchool("CAS",url=>{

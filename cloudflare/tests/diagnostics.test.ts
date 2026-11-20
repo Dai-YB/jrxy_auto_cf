@@ -2,7 +2,7 @@ import {beforeEach,describe,expect,it,vi} from "vitest";
 import {env} from "cloudflare:workers";
 import {applyD1Migrations,reset,createExecutionContext} from "cloudflare:test";
 import {randomBytes} from "node:crypto";
-import {Session} from "../src/engine/http";
+import {Session,responseCookies} from "../src/engine/http";
 import {login} from "../src/engine/login";
 import {safeDiagnostic} from "../src/diagnostics";
 import {createCodeBatch,publicRedemption,processEnrollment,listEnrollments,cleanupEnrollments} from "../src/redemption";
@@ -24,6 +24,29 @@ describe("safe request diagnostics",()=>{
     expect(safeDiagnostic(value)).toEqual({stage:"login_submit",kind:"http",host:"login.example.edu",method:"POST",httpStatus:503,elapsedMs:2});
     expect(safeDiagnostic({...value,host:"private-student.example.edu"},["private-student"])).not.toHaveProperty("host");
     expect(safeDiagnostic({...value,host:value.url})).not.toHaveProperty("host");expect(safeDiagnostic({stage:"injected",kind:"transport"})).toBeNull();
+  });
+  it("supports both cookie APIs without splitting Expires commas or merging cookies",()=>{
+    const values=["first=a; Expires=Wed, 01 Jan 2031 00:00:00 GMT; Path=/","second=b; Path=/"];
+    expect(responseCookies({getSetCookie:()=>values} as any)).toEqual(values);
+    const getAll=vi.fn(()=>values);expect(responseCookies({getAll} as any)).toEqual(values);expect(getAll).toHaveBeenCalledWith("Set-Cookie");
+    expect(responseCookies({has:()=>false} as any)).toEqual([]);
+    expect(()=>responseCookies({has:()=>true} as any)).toThrow("Set-Cookie");
+  });
+  it("does not report response header processing exceptions as a network failure",async()=>{
+    const response=new Response("ok");Object.defineProperty(response.headers,"getSetCookie",{value:()=>{throw new Error("private-password hidden detail");}});
+    const transport=vi.fn(async()=>response);
+    const error=await new Session(transport as any).at("tenant_list").request("https://mobile.campushoy.com/list").catch(value=>value);
+    expect(error).toMatchObject({retryable:false,diagnostic:{kind:"response_processing",phase:"headers",httpStatus:200}});
+    expect(JSON.stringify(error)).not.toContain("private-password");expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it("distinguishes a broken response stream from failure before response headers",async()=>{
+    const stream=new ReadableStream({start(controller){controller.error(new Error("private-cookie"));}});
+    const error=await new Session(vi.fn(async()=>new Response(stream)) as any).at("portal").request("https://login.example.edu/").catch(value=>value);
+    expect(error).toMatchObject({retryable:true,diagnostic:{kind:"body_read",phase:"body",httpStatus:200}});expect(error.message).not.toContain("private-cookie");
+  });
+  it("preserves the new processing phase in safe metadata without any error text",()=>{
+    expect(safeDiagnostic({stage:"portal",kind:"response_processing",phase:"headers",message:"private"})).toEqual({stage:"portal",kind:"response_processing",phase:"headers"});
+    expect(safeDiagnostic({stage:"portal",kind:"transport",phase:"private"})).not.toHaveProperty("phase");
   });
   it("distinguishes a transport failure from an HTTP response without copying the exception",async()=>{
     const transport=vi.fn(async()=>{throw new Error("TLS or DNS details with password=private-password");});
@@ -76,9 +99,11 @@ describe("safe request diagnostics",()=>{
     await e.DB.prepare("UPDATE enrollment_attempts SET expires_at=?").bind(Date.now()-1).run();expect(await listEnrollments(e)).toEqual([]);await cleanupEnrollments(e);
     expect((await e.DB.prepare("SELECT count(*) AS n FROM enrollment_attempts").first<any>()).n).toBe(0);
   });
-  it.each([["timeout","timeout"],["total_timeout","timeout"],["http","upstream"]] as const)("maps %s to a safe public category without retrying login",async(kind,code)=>{
+  it.each([["timeout","timeout"],["total_timeout","timeout"],["http","upstream"],["body_read","response_read"],["response_processing","protocol"]] as const)("maps %s to a safe public category without retrying login",async(kind,code)=>{
     const {row}=await attempt(),run=vi.fn().mockRejectedValue(new EngineError("do not expose this error","error",true,{stage:"captcha_check",kind,httpStatus:kind==="http"?503:undefined}));
     await processEnrollment(e,row.id,run);await processEnrollment(e,row.id,run);expect(run).toHaveBeenCalledTimes(1);
     expect((await e.DB.prepare("SELECT error_code FROM enrollment_attempts").first<any>()).error_code).toBe(code);
+    expect((await e.DB.prepare("SELECT status FROM redemption_codes").first<any>()).status).toBe("unused");
+    expect((await e.DB.prepare("SELECT count(*) AS n FROM accounts").first<any>()).n).toBe(0);
   });
 });

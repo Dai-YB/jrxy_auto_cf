@@ -162,13 +162,14 @@ async function loadEnrollments(){
   $("enrollmentList").replaceChildren();$("enrollmentEmpty").hidden=data.attempts.length>0;
   const states={pending:"等待验证",verifying:"验证中",ready:"正在保存",succeeded:"已开通",failed:"未开通"};
   const stages={request:"上游请求",tenant_list:"获取学校列表",tenant_info:"获取学校信息",portal:"打开校园入口及跳转",login_form:"解析学校登录页",login_ticket:"获取登录票据",captcha_check:"检查验证码",login_submit:"提交学校登录",login_callback:"登录回跳",setup:"准备或保存账号"};
-  const kinds={timeout:"单次请求超时",total_timeout:"总网络时限已到",transport:"连接或读取失败（DNS / TLS / 网络中断待核实）",http:"上游HTTP异常",response:"响应或登录校验未通过",request_limit:"请求次数超限",redirect_limit:"重定向次数超限",policy:"地址或跨域请求不符合安全规则",internal:"内部处理异常"};
+  const kinds={timeout:"单次请求超时",total_timeout:"总网络时限已到",transport:"发送失败，未取得响应（DNS / TLS / 连接原因待核实）",body_read:"已取得响应，正文读取中断",response_processing:"已取得响应，响应头或内容处理错误",http:"上游HTTP异常",response:"响应或登录校验未通过",request_limit:"请求次数超限",redirect_limit:"重定向次数超限",policy:"地址或跨域请求不符合安全规则",internal:"内部处理异常"};
   for(const attempt of data.attempts){
     const item=element("details",undefined,"log-entry"),summary=element("summary"),info=element("div",undefined,"log-text");
     info.append(element("b","兑换码 …"+attempt.suffix),element("small",attempt.createdAt+"（"+attempt.timezone+"）"));
     summary.append(info,badge(states[attempt.status]||attempt.status,attempt.status==="failed"?"bad":attempt.status==="succeeded"?"ok":"warn"));item.append(summary);
     const d=attempt.diagnostic,lines=[attempt.message||states[attempt.status]||attempt.status];
-    if(d){lines.push("阶段："+(stages[d.stage]||"未知"),"分类："+(kinds[d.kind]||"未知"));if(d.host)lines.push("目标域名："+d.host);if(d.method)lines.push("方法："+d.method);if(d.httpStatus)lines.push("HTTP："+d.httpStatus);if(d.elapsedMs!=null)lines.push("请求耗时："+d.elapsedMs+" ms");}
+    const phases={send:"发送请求，尚未取得响应",headers:"处理响应头与Cookie",body:"读取响应正文",decode:"解码响应正文",json:"解析JSON响应"};
+    if(d){lines.push("阶段："+(stages[d.stage]||"未知"),"分类："+(kinds[d.kind]||"未知"));if(d.phase)lines.push("处理环节："+(phases[d.phase]||"未知"));if(d.host)lines.push("目标域名："+d.host);if(d.method)lines.push("方法："+d.method);if(d.httpStatus)lines.push("HTTP："+d.httpStatus);if(d.elapsedMs!=null)lines.push("请求耗时："+d.elapsedMs+" ms");}
     else if(attempt.status==="failed")lines.push("没有详细诊断；旧版本记录或验证已被撤销/中断。");
     item.append(element("pre",lines.join("\n")));$("enrollmentList").append(item);
   }

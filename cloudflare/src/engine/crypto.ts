@@ -4,6 +4,8 @@ import { constants, createCipheriv, createHash, privateDecrypt, publicEncrypt } 
 import { Buffer } from "node:buffer";
 import { EngineError } from "../types";
 import { IOS_UA, Session } from "./http";
+import { pythonJson } from "./encoding";
+export { pythonJson } from "./encoding";
 
 const PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCpwqE77zx+WexQWf1qDzb8EGey
@@ -55,19 +57,6 @@ export function pythonStr(v: unknown): string {
   if (v && typeof v === "object") return "{" + Object.entries(v).map(([k,value]) => pythonRepr(k) + ": " + pythonRepr(value)).join(", ") + "}";
   return String(v);
 }
-export function pythonJson(value: unknown): string {
-  if (typeof value === "string") return JSON.stringify(value,undefined,0);
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) return "null";
-    if (Object.is(value,-0)) return "-0.0";
-    return String(value);
-  }
-  if (typeof value === "boolean") return value ? "true" : "false";
-  if (value === null || value === undefined) return "null";
-  if (Array.isArray(value)) return "[" + value.map(pythonJson).join(", ") + "]";
-  if (value && typeof value === "object") return "{" + Object.entries(value).map(([k,v]) => JSON.stringify(k) + ": " + pythonJson(v)).join(", ") + "}";
-  throw new EngineError("表单包含不支持的字段类型");
-}
 export function pythonFloat(value: number): string {
   if (!Number.isFinite(value)) throw new EngineError("坐标必须为有限数字");
   if (Object.is(value,-0)) return "-0.0";
@@ -109,7 +98,7 @@ export async function fetchSecret(session: Session, tenant: string, deviceId: st
       lon: 0, lat: 0, cpdailyVersion: "9.9.22", systemVersion: "14", userId: "" })) };
   for (const host of ["https://data-xxt.aichaoxing.com/", "https://mobile.campushoy.com/"]) {
     try {
-      let response = await session.json(host + "app/auth/dynamic/secret/getSecretKey/v-920", data, headers);
+      let response = await session.json(host + "app/auth/dynamic/secret/getSecretKey/v-920", data, headers, {timeoutMs:20000});
       for (let i = 0; i < 6 && response && typeof response === "object"; i++) {
         const key = ["data", "datas", "result"].find(k => k in response);
         if (!key) break;
@@ -118,7 +107,7 @@ export async function fetchSecret(session: Session, tenant: string, deviceId: st
       if (typeof response !== "string") continue;
       const parts = privateDecrypt({ key: PROTOCOL_PRIVATE_KEY, padding: constants.RSA_PKCS1_PADDING }, Buffer.from(response, "base64"))
         .toString("utf8").split("|");
-      if (parts.length < 3 || !parts[2]) continue;
+      if (parts.length < 3 || parts.slice(0,3).some(part=>!part)) continue;
       const key = interleave("h8r7uN8t" + parts[2]);
       if (Buffer.byteLength(key) === 16) return key;
     } catch (e) {

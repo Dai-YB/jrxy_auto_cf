@@ -38,7 +38,7 @@ describe("HTTP isolation", () => {
     });
     await new Session(transport as any).request("https://cas.example.edu/login",{method:"POST",body:"password=secret"});
     expect(calls[1].init.method).toBe("GET");expect(calls[1].init.body).toBeUndefined();
-    expect(calls[1].init.headers.get("cookie")).toBe("");
+    expect(calls[1].init.headers.has("cookie")).toBe(false);
     const cross = new Session(vi.fn(async()=>new Response(null,{status:307,headers:{Location:"https://other.example.edu/"}})) as any);
     await expect(cross.request("https://cas.example.edu/login",{method:"POST",body:"secret"})).rejects.toThrow("拒绝");
   });
