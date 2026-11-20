@@ -3,11 +3,14 @@ import { getAccount } from "./storage";
 import { classify, notification, notifyHead, notifyOption, sendNotify } from "./notify";
 import { redact, requireConfigured, seal } from "./security";
 import { settings } from "./config";
+import { accountValid } from "./identity";
+import { cleanupExpiredAccounts } from "./expiry";
 import { AppError, EngineError, type Batch, type Env, type Job, type Mode, type Result } from "./types";
 
 export async function enqueue(env: Env, names: string[], mode: Mode, triggerLabel = "手动"): Promise<string[]> {
   requireConfigured(env);
   if (!names.length) return [];
+  if(names.length===1)await getAccount(env,names[0]);
   if(mode==="submit" && names.length===1) {
     const account=await env.DB.prepare("SELECT paused FROM accounts WHERE name=? AND deleted=0").bind(names[0]).first<{paused:number}>();
     if(account?.paused)throw new AppError("账号已暂停，请恢复后再签到",409);
@@ -20,9 +23,9 @@ export async function enqueue(env: Env, names: string[], mode: Mode, triggerLabe
       .bind(batchId,mode,triggerLabel,now,now),
     env.DB.prepare(`INSERT INTO jobs(id,account,mode,trigger,next_at,created_at,trigger_label,batch_id,sequence_no,account_version)
       SELECT ? || ':' || a.name,a.name,?,'manual',?,?,?,?,CAST(n.key AS INTEGER),a.pause_version
-      FROM json_each(?) n JOIN accounts a ON a.name=n.value WHERE a.deleted=0 AND (?!='submit' OR a.paused=0) AND NOT EXISTS
+      FROM json_each(?) n JOIN accounts a ON a.name=n.value WHERE a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?) AND (?!='submit' OR a.paused=0) AND NOT EXISTS
       (SELECT 1 FROM jobs WHERE account=a.name AND (status!='done' OR report_pending=1)) RETURNING id`)
-      .bind(batchId,mode,now,now,triggerLabel,batchId,JSON.stringify(names),mode)
+      .bind(batchId,mode,now,now,triggerLabel,batchId,JSON.stringify(names),now,mode)
   ]);
   const ids = rows.slice(1).flatMap(row => row.results.map(value => String(value.id)));
   if (!ids.length) {
@@ -48,14 +51,14 @@ export async function advanceBatch(env: Env, id: string, now = Date.now()): Prom
     const summary = Object.entries(counts).map(([key, value]) => `${key} ${value}`).join(" / ");
     const detail = lines.join("\n");
     const results = await env.DB.batch([
-      env.DB.prepare(`INSERT INTO sign_log(ts,kind,result,detail) SELECT ?,?, ?,? FROM batches
-        WHERE id=? AND finished_at IS NULL AND (trigger='schedule' OR label='批量')`)
-        .bind(now, `${batch.label}汇总`, summary, detail.slice(-4000), id),
+      env.DB.prepare(`INSERT INTO sign_log(ts,kind,result,detail,batch_id) SELECT ?,?,?,?,id FROM batches
+        WHERE id=? AND privacy_version=? AND finished_at IS NULL AND (trigger='schedule' OR label='批量')`)
+        .bind(now, `${batch.label}汇总`, summary, detail.slice(-4000), id,batch.privacy_version),
       env.DB.prepare(`UPDATE schedule SET last_run=?,last_result=? WHERE id=1 AND EXISTS
-        (SELECT 1 FROM batches WHERE id=? AND trigger='schedule' AND finished_at IS NULL)`)
-        .bind(batch.created_at, summary, id),
-      env.DB.prepare("UPDATE batches SET finished_at=?,summary=?,detail=? WHERE id=? AND finished_at IS NULL")
-        .bind(now, summary, detail, id)
+        (SELECT 1 FROM batches WHERE id=? AND privacy_version=? AND trigger='schedule' AND finished_at IS NULL)`)
+        .bind(batch.created_at, summary, id,batch.privacy_version),
+      env.DB.prepare("UPDATE batches SET finished_at=?,summary=?,detail=? WHERE id=? AND privacy_version=? AND finished_at IS NULL")
+        .bind(now, summary, detail, id,batch.privacy_version)
     ]);
     void results;
     return;
@@ -107,6 +110,8 @@ export async function dispatch(env: Env): Promise<void> {
 }
 
 async function finishReport(env: Env, job: Job, owner: string): Promise<void> {
+  const eligibility=await env.DB.prepare("SELECT deleted,authorization_until FROM accounts WHERE name=?").bind(job.account).first<{deleted:number;authorization_until:number|null}>();
+  if(!eligibility || !accountValid(eligibility))return;
   let result = JSON.parse(job.result!) as Result;
   let retry = job.status === "pending";
   // 报告阶段也要核对暂停版本，避免暂停发生在重试结果落盘之后而旧任务仍显示为待重试。
@@ -130,7 +135,7 @@ async function finishReport(env: Env, job: Job, owner: string): Promise<void> {
     else if (retry) push = `推送跳过（执行异常，${settings(env).retryMs / 60_000} 分钟后重试）`;
     else if (job.mode === "dry" || job.mode === "submit") {
       const notifyClaim = await env.DB.prepare(`UPDATE jobs SET notified=1 WHERE id=? AND owner=? AND notified=0
-        AND report_pending=1 RETURNING id`).bind(job.id, owner).first();
+        AND report_pending=1 AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?)) RETURNING id`).bind(job.id, owner,Date.now()).first();
       if (notifyClaim) {
         try {
           const { account } = await getAccount(env, job.account);
@@ -150,9 +155,9 @@ async function finishReport(env: Env, job: Job, owner: string): Promise<void> {
   const label = job.mode === "login" ? (result.status === "success" ? "登录成功" : "登录失败")
     : job.mode === "range" ? (result.status === "success" ? "签到范围已获取并应用" : "范围获取失败") : classify(result);
   await env.DB.batch([
-    env.DB.prepare(`INSERT INTO sign_log(ts,account,kind,result,detail) SELECT ?,account,?,?,? FROM jobs
-      WHERE id=? AND owner=? AND report_pending=1`)
-      .bind(now, `${trigger}${action}[${job.account}]`, label, ((result.detail || result.message) + (push ? `\n\n[${push}]` : "")).slice(-4000), job.id, owner),
+    env.DB.prepare(`INSERT INTO sign_log(ts,account,kind,result,detail,batch_id) SELECT ?,account,?,?,?,batch_id FROM jobs
+      WHERE id=? AND owner=? AND report_pending=1 AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?))`)
+      .bind(now, `${trigger}${action}[${job.account}]`, label, ((result.detail || result.message) + (push ? `\n\n[${push}]` : "")).slice(-4000), job.id, owner,now),
     env.DB.prepare(`UPDATE batches SET last_finished_at=? WHERE id=? AND EXISTS
       (SELECT 1 FROM jobs WHERE id=? AND owner=? AND report_pending=1)`).bind(now, job.batch_id, job.id, owner),
     env.DB.prepare(`UPDATE jobs SET next_at=max(next_at,?),dispatched_at=0 WHERE batch_id=? AND status='pending'
@@ -172,6 +177,8 @@ export async function processJob(env: Env, id: string, run = execute): Promise<v
   const lease = now + cfg.runTimeoutMs + 60_000;
   const job = await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(id).first<Job>();
   if (!job || (job.status === "done" && !job.report_pending) || job.lease_until > now) return;
+  const eligibility=await env.DB.prepare("SELECT deleted,authorization_until FROM accounts WHERE name=?").bind(job.account).first<{deleted:number;authorization_until:number|null}>();
+  if(!eligibility||!accountValid(eligibility,now)){await cleanupExpiredAccounts(env,now);return;}
   const batch = await env.DB.prepare("SELECT * FROM batches WHERE id=?").bind(job.batch_id).first<Batch>();
   if (!batch || batch.finished_at) return;
   if (!job.report_pending && (job.status !== "pending" || job.next_at > now || batch.round_due > now || job.attempts >= batch.round)) return;
@@ -212,11 +219,12 @@ export async function processJob(env: Env, id: string, run = execute): Promise<v
           beforeSubmit: async checkpoint => {
             const saved = await env.DB.prepare(`UPDATE jobs SET checkpoint=? WHERE id=? AND owner=? AND status='running'
               AND lease_until>? AND EXISTS(SELECT 1 FROM execution_gate WHERE id=1 AND owner=?)
-              AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND a.paused=0 AND a.pause_version=jobs.account_version) RETURNING id`)
-              .bind(JSON.stringify(checkpoint), id, owner, Date.now(), owner).first();
+              AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND a.paused=0 AND a.pause_version=jobs.account_version AND (a.authorization_until IS NULL OR a.authorization_until>?)) RETURNING id`)
+              .bind(JSON.stringify(checkpoint), id, owner, Date.now(), owner,Date.now()).first();
             if (!saved) {
-              const state=await env.DB.prepare("SELECT paused,pause_version FROM accounts WHERE name=?").bind(current.account).first<{paused:number;pause_version:number}>();
-              if(!state || state.paused || state.pause_version!==current.account_version)throw new EngineError("账号已暂停，本次未提交签到","paused");
+              const state=await env.DB.prepare("SELECT paused,pause_version,authorization_until FROM accounts WHERE name=?").bind(current.account).first<{paused:number;pause_version:number;authorization_until:number|null}>();
+              if(!state || !accountValid(state))throw new EngineError("授权已到期，本次未提交签到","expired");
+              if(state.paused || state.pause_version!==current.account_version)throw new EngineError("账号已暂停，本次未提交签到","paused");
               throw new AppError("任务租约失效，拒绝提交",409);
             }
           }
@@ -235,6 +243,8 @@ export async function processJob(env: Env, id: string, run = execute): Promise<v
       } catch (e) {
         result = { status: "fail", message: e instanceof AppError ? e.message : "任务无法读取配置或执行，请检查账号与服务设置" };
       }
+      const stillValid=await env.DB.prepare("SELECT deleted,authorization_until FROM accounts WHERE name=?").bind(current.account).first<{deleted:number;authorization_until:number|null}>();
+      if(!stillValid||!accountValid(stillValid)){await cleanupExpiredAccounts(env);return;}
       if(current.mode==="submit" && result.retryable) {
         const state=await env.DB.prepare("SELECT paused,pause_version FROM accounts WHERE name=? AND deleted=0").bind(current.account).first<{paused:number;pause_version:number}>();
         if(!state || state.paused || state.pause_version!==current.account_version)result={status:"paused",message:"任务未完成，但账号已暂停或恢复过；不再重试旧任务"};
@@ -242,13 +252,13 @@ export async function processJob(env: Env, id: string, run = execute): Promise<v
       const retry = result.retryable === true && current.trigger === "schedule" && current.attempts < current.max_attempts;
       const finished = Date.now();
       const statements: D1PreparedStatement[] = [];
-      if (rangeConfig) statements.push(env.DB.prepare(`UPDATE accounts SET config=? WHERE name=? AND deleted=0
-        AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND owner=? AND status='running')`).bind(rangeConfig, current.account, id, owner));
+      if (rangeConfig) statements.push(env.DB.prepare(`UPDATE accounts SET config=? WHERE name=? AND deleted=0 AND (authorization_until IS NULL OR authorization_until>?)
+        AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND owner=? AND status='running')`).bind(rangeConfig, current.account, finished,id, owner));
       statements.push(env.DB.prepare(`UPDATE jobs SET status=?,result=?,next_at=?,finished_at=?,report_pending=1,dispatched_at=0,notification_result=NULL,notified=0,
         checkpoint=CASE WHEN ?=1 THEN NULL ELSE checkpoint END
-        WHERE id=? AND owner=? AND status='running' RETURNING *`)
+        WHERE id=? AND owner=? AND status='running' AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?)) RETURNING *`)
         .bind(retry ? "pending" : "done", JSON.stringify(result), finished + (retry ? cfg.retryMs : 0), retry ? null : finished,
-          retry ? 1 : 0, id, owner));
+          retry ? 1 : 0, id, owner,finished));
       const saved = await env.DB.batch(statements);
       const reporting = saved[saved.length - 1].results[0] as unknown as Job | undefined;
       if (reporting) await finishReport(env, reporting, owner);
@@ -269,6 +279,6 @@ async function release(env: Env, account: string, owner: string): Promise<void> 
 export async function jobView(env: Env, ids: string[]): Promise<Record<string, unknown>[]> {
   if (!ids.length || ids.length > 50 || ids.some(id => id.length > 200)) throw new AppError("无效任务列表");
   const rows = await env.DB.prepare(`SELECT id,account,mode,trigger,status,attempts,created_at,finished_at,result,next_at,report_pending
-    FROM jobs WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at,sequence_no`).bind(...ids).all<any>();
+    FROM jobs WHERE id IN (${ids.map(() => "?").join(",")}) AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?)) ORDER BY created_at,sequence_no`).bind(...ids,Date.now()).all<any>();
   return rows.results.map(row => ({ ...row, status: row.report_pending ? "running" : row.status, result: row.result ? JSON.parse(row.result) : null }));
 }

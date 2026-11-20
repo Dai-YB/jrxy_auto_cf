@@ -4,7 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-10",
   "compatibility_flags": ["nodejs_compat"],
-  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": ["/api/*"] },
+  "assets": { "directory": "./public", "binding": "ASSETS", "html_handling": "none", "run_worker_first": ["/api/*", "/", "/admin", "/admin/"] },
   "d1_databases": [{
     "binding": "DB", "database_name": "jrxy-auto-cf",
     "database_id": "00000000-0000-0000-0000-000000000000",

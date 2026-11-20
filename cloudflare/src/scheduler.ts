@@ -2,6 +2,8 @@ import { AppError, type Env, type Schedule } from "./types";
 import { dispatch } from "./jobs";
 import { requireConfigured } from "./security";
 import { localTime, settings } from "./config";
+import { cleanupExpiredAccounts } from "./expiry";
+import { cleanupEnrollments, indexLegacyIdentities } from "./redemption";
 export { localTime } from "./config";
 
 const DAY = 86_400_000;
@@ -60,6 +62,9 @@ export async function updateSchedule(env: Env, body: Record<string, unknown>): P
 }
 export async function tick(env: Env, now = Date.now()): Promise<void> {
   requireConfigured(env);
+  await cleanupExpiredAccounts(env,now);
+  await cleanupEnrollments(env,now);
+  await indexLegacyIdentities(env);
   const cfg = settings(env);
   const s = await getSchedule(env, now);
   const slot = dueSlot(s, now, cfg.catchupMs / 60_000, cfg.timezone);
@@ -75,9 +80,9 @@ export async function tick(env: Env, now = Date.now()): Promise<void> {
         .bind(id, label, now, now, s.revision, String(slot)),
       env.DB.prepare(`INSERT OR IGNORE INTO jobs(id,account,mode,trigger,max_attempts,next_at,created_at,trigger_label,batch_id,sequence_no,account_version)
         SELECT ? || ':' || name,name,'submit','schedule',?,?,?,?,?,ROW_NUMBER() OVER(ORDER BY name)-1,pause_version
-        FROM accounts WHERE deleted=0 AND paused=0 AND resume_after<? AND EXISTS(SELECT 1 FROM batches WHERE id=? AND finished_at IS NULL)
+        FROM accounts WHERE deleted=0 AND paused=0 AND resume_after<? AND (authorization_until IS NULL OR authorization_until>?) AND EXISTS(SELECT 1 FROM batches WHERE id=? AND finished_at IS NULL)
         AND EXISTS(SELECT 1 FROM schedule WHERE id=1 AND revision=? AND enabled=1 AND last_slot IS NOT ?)`)
-        .bind(id, cfg.maxAttempts, now, now, label, id, slot, id, s.revision, String(slot)),
+        .bind(id, cfg.maxAttempts, now, now, label, id, slot,now, id, s.revision, String(slot)),
       env.DB.prepare(`UPDATE schedule SET last_slot=? WHERE id=1 AND revision=? AND enabled=1
         AND EXISTS(SELECT 1 FROM batches WHERE id=?)`).bind(String(slot), s.revision, id),
       env.DB.prepare(`UPDATE batches SET finished_at=?,summary='没有可用账号',detail='' WHERE id=?

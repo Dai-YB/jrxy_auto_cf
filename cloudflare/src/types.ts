@@ -1,6 +1,6 @@
 export interface Env {
   DB: D1Database;
-  JOBS: Queue<{ id: string }>;
+  JOBS: Queue<{ id: string; kind?: "enrollment" }>;
   ASSETS: Fetcher;
   ADMIN_USERNAME: string;
   ADMIN_PASSWORD: string;
@@ -43,10 +43,14 @@ export interface AccountRow {
   paused: number;
   pause_version: number;
   resume_after: number;
+  identity_key: string | null;
+  grant_code_id: string | null;
+  authorization_from: number | null;
+  authorization_until: number | null;
 }
 export type Mode = "dry" | "submit" | "login" | "range";
 export interface Result {
-  status: "success" | "already" | "no_task" | "dry" | "fail" | "error" | "captcha" | "unsupported" | "uncertain" | "paused";
+  status: "success" | "already" | "no_task" | "dry" | "fail" | "error" | "captcha" | "unsupported" | "uncertain" | "paused" | "expired";
   message: string;
   detail?: string;
   retryable?: boolean;
@@ -90,6 +94,7 @@ export interface Batch {
   finished_at: number | null;
   summary: string | null;
   detail: string | null;
+  privacy_version: number;
 }
 export interface Schedule {
   id: number;
@@ -111,7 +116,7 @@ export class EngineError extends Error {
 }
 export const LABELS: Record<Result["status"], string> = {
   success: "签到成功", already: "今日已签到", no_task: "暂无待签任务", dry: "探测通过",
-  fail: "签到失败", error: "执行异常", captcha: "需要人工验证", unsupported: "任务不支持", uncertain: "提交状态待确认", paused: "账号已暂停"
+  fail: "签到失败", error: "执行异常", captcha: "需要人工验证", unsupported: "任务不支持", uncertain: "提交状态待确认", paused: "账号已暂停", expired: "授权已到期"
 };
 export function boundedInt(value: string | undefined, fallback: number, min: number, max: number): number {
   const n = Number(value ?? fallback);

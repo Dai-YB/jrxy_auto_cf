@@ -7,6 +7,8 @@ import { dispatch, enqueue, jobView, processJob } from "./jobs";
 import { localTime, scheduleView, tick, updateSchedule } from "./scheduler";
 import { extractDeviceId } from "./engine/device";
 import { settings } from "./config";
+import { createCodeBatch, listCodeBatches, revokeCode, publicRedemption, processEnrollment } from "./redemption";
+import { cleanupExpiredAccounts } from "./expiry";
 
 const json = (data: unknown, status = 200): Response => Response.json(data, { status, headers: {
   "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"
@@ -15,12 +17,17 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  if(method==="POST" && ["/api/public/redemption/check","/api/public/redemption/start","/api/public/redemption/status"].includes(path))return publicRedemption(request,env,path);
   if(path==="/api/auth/login" && method==="POST")return signIn(request,env);
   if(path==="/api/auth/logout" && method==="POST")return signOut(request,env);
   const identity=await authorize(request,env);
   if(path==="/api/auth/session" && method==="GET")return json(identity);
+  if(path==="/api/redemption/batches" && method==="GET")return json(await listCodeBatches(env));
+  if(path==="/api/redemption/batches" && method==="POST")return json(await createCodeBatch(env,await readJson(request)),201);
+  const revoke=/^\/api\/redemption\/codes\/([A-Za-z0-9-]+)\/revoke$/.exec(path);
+  if(revoke && method==="POST"){await revokeCode(env,revoke[1]);return json({ok:true});}
   if (path === "/api/status" && method === "GET") {
-    const count = await env.DB.prepare("SELECT count(*) AS n,coalesce(sum(paused),0) AS paused FROM accounts WHERE deleted=0").first<{n: number;paused:number}>();
+    const count = await env.DB.prepare("SELECT count(*) AS n,coalesce(sum(paused),0) AS paused FROM accounts WHERE deleted=0 AND (authorization_until IS NULL OR authorization_until>?)").bind(Date.now()).first<{n: number;paused:number}>();
     const offset = settings(env).timezone;
     return json({ platform: "Cloudflare Workers", engine_ready:true, accounts_dir:"D1 accounts", timezone:`UTC${offset >= 0 ? "+" : ""}${offset}`,
       account_count: count?.n ?? 0, paused_count:count?.paused ?? 0, scheduler: await scheduleView(env), server_time: localTime(Date.now(),offset) });
@@ -70,7 +77,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (path === "/api/batch-run" && method === "POST") {
     const { mode } = await readJson(request);
     if (mode !== "dry" && mode !== "submit") throw new AppError("仅支持 dry / submit");
-    const names = await env.DB.prepare("SELECT name,paused FROM accounts WHERE deleted=0 ORDER BY name").all<{name: string;paused:number}>();
+    const names = await env.DB.prepare("SELECT name,paused FROM accounts WHERE deleted=0 AND (authorization_until IS NULL OR authorization_until>?) ORDER BY name").bind(Date.now()).all<{name: string;paused:number}>();
     const eligible=names.results.filter(account=>mode!=="submit" || !account.paused);
     const ids = await enqueue(env, eligible.map(n => n.name), mode, "批量");
     ctx.waitUntil(dispatch(env));
@@ -81,7 +88,10 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (path === "/api/logs" && method === "GET") {
     const raw = Number(url.searchParams.get("limit") ?? 50);
     const limit = Number.isFinite(raw) ? Math.max(1,Math.min(Math.trunc(raw),200)) : 50;
-    const logs = await env.DB.prepare("SELECT ts,account,kind,result,detail FROM sign_log ORDER BY id DESC LIMIT ?").bind(limit).all<any>();
+    const logs = await env.DB.prepare(`SELECT ts,account,kind,result,detail FROM sign_log WHERE
+      NOT EXISTS(SELECT 1 FROM accounts a WHERE a.name=sign_log.account AND a.grant_code_id IS NOT NULL AND a.authorization_until<=?)
+      AND NOT EXISTS(SELECT 1 FROM jobs j JOIN accounts a ON a.name=j.account WHERE j.batch_id=sign_log.batch_id AND a.grant_code_id IS NOT NULL AND a.authorization_until<=?)
+      ORDER BY id DESC LIMIT ?`).bind(Date.now(),Date.now(),limit).all<any>();
     return json({ logs: logs.results.map(row => ({...row,ts:localTime(row.ts,settings(env).timezone)})) });
   }
   if (path === "/api/logs/clear" && method === "POST") {
@@ -93,19 +103,27 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
 }
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (!new URL(request.url).pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
+    const path=new URL(request.url).pathname;
+    if(path==="/" || path==="/admin" || path==="/admin/"){
+      const url=new URL(request.url);url.pathname=path==="/"?"/index.html":"/admin.html";
+      const response=await env.ASSETS.fetch(new Request(url,request));
+      const headers=new Headers(response.headers);headers.set("Cache-Control","no-store");
+      return new Response(response.body,{status:response.status,headers});
+    }
+    if (!path.startsWith("/api/")) return env.ASSETS.fetch(request);
     try { return await api(request, env, ctx); }
     catch (e) { return json({ detail: e instanceof AppError ? e.message : "内部处理失败，请检查数据库迁移与服务配置" }, e instanceof AppError ? e.code : 500); }
   },
   async scheduled(controller: ScheduledController, env: Env): Promise<void> { await tick(env, controller.scheduledTime); },
-  async queue(batch: MessageBatch<{ id: string }>, env: Env): Promise<void> {
+  async queue(batch: MessageBatch<{ id: string;kind?:"enrollment" }>, env: Env): Promise<void> {
     for (const message of batch.messages) {
       try {
         if (typeof message.body?.id !== "string" || message.body.id.length > 200) { message.ack(); continue; }
-        await processJob(env, message.body.id);
-        await dispatch(env);
+        if(message.body.kind==="enrollment")await processEnrollment(env,message.body.id);
+        else if(message.body.kind===undefined){await cleanupExpiredAccounts(env);await processJob(env, message.body.id);await dispatch(env);}
+        else {message.ack();continue;}
         message.ack();
       } catch { message.retry({ delaySeconds: 60 }); }
     }
   }
-} satisfies ExportedHandler<Env, { id: string }>;
+} satisfies ExportedHandler<Env, { id: string;kind?:"enrollment" }>;

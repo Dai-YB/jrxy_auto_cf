@@ -1,6 +1,6 @@
 "use strict";
 const $ = id => document.getElementById(id);
-const labels = {success:"签到成功",already:"今日已签到",no_task:"暂无待签任务",dry:"探测通过",fail:"签到失败",error:"执行异常",captcha:"需要人工验证",unsupported:"任务不支持",uncertain:"提交状态待确认",paused:"账号已暂停"};
+const labels = {success:"签到成功",already:"今日已签到",no_task:"暂无待签任务",dry:"探测通过",fail:"签到失败",error:"执行异常",captcha:"需要人工验证",unsupported:"任务不支持",uncertain:"提交状态待确认",paused:"账号已暂停",expired:"授权已到期"};
 const modes = {dry:"探测",submit:"签到",login:"登录测试",range:"范围获取"};
 const pendingKey = "jrxy_pending_jobs_v2";
 let csrfToken = "", signedIn = false, editingName = "", originalDevice = "", accounts = [], filter = "all";
@@ -51,6 +51,7 @@ function showLogin() {
   for(const dialog of [$("accountDialog"),$("confirmDialog")])if(dialog.open)dialog.close();
   if(confirmResolve){confirmResolve(false);confirmResolve=null;}
   $("accountForm").reset();$("accountRows").replaceChildren();$("accountCards").replaceChildren();$("logList").replaceChildren();
+  $("codeBatchForm").reset();$("codeBatchList").replaceChildren();hideGeneratedCodes();
   $("boot").hidden=true;$("appView").hidden=true;$("loginView").hidden=false;$("taskResult").hidden=true;$("toast").hidden=true;
   $("loginPassword").value="";
 }
@@ -108,7 +109,9 @@ async function loadAccounts() {
 function identity(account) {
   const block=element("div",undefined,"account-identity");
   block.append(element("span",account.name.slice(0,1),"account-avatar"));
-  const info=element("div");info.append(element("b",account.name),element("small",account.schoolName),element("small",account.username,"student"));block.append(info);return block;
+  const info=element("div");info.append(element("b",account.name),element("small",account.schoolName),element("small",account.username,"student"));
+  if(account.authorization_until)info.append(element("small","有效至 "+new Date(account.authorization_until).toLocaleString(),"grant-expiry"));
+  block.append(info);return block;
 }
 function accountActions(account,mobile=false) {
   const actions=element("div",undefined,mobile?"card-actions":"row-actions");
@@ -152,7 +155,7 @@ async function loadLogs() {
     details.append(summary,element("pre",log.detail||"无详情"));$("logList").append(details);
   }
 }
-async function refresh(updateForm=false) { await Promise.all([loadStatus(updateForm),loadAccounts(),loadLogs()]); }
+async function refresh(updateForm=false) { await Promise.all([loadStatus(updateForm),loadAccounts(),loadLogs(),loadCodeBatches()]); }
 async function togglePaused(account) {
   if(!account.paused&&!await confirmAction("暂停此账号？",`暂停「${account.name}」后，定时、批量和手动签到都将停止。已经发送的签到请求无法撤回。`,"暂停账号"))return;
   const result=await api(`/api/accounts/${encodeURIComponent(account.name)}/pause`,"POST",{paused:!account.paused});
@@ -161,7 +164,8 @@ async function togglePaused(account) {
   await refresh();await pollJobs();
 }
 async function removeAccount(account) {
-  if(!await confirmAction("删除账号？",`删除「${account.name}」的账号配置，设备绑定仍会保留。此操作不能撤销。`,"删除账号",true))return;
+  const note=account.source==="redemption"?"该兑换账号的凭据、设备绑定与关联记录将被删除，兑换码不会恢复可用。":"账号配置将删除，设备绑定仍会保留。";
+  if(!await confirmAction("删除账号？",`删除「${account.name}」？${note}此操作不能撤销。`,"删除账号",true))return;
   await api("/api/accounts/"+encodeURIComponent(account.name),"DELETE");toast("账号已删除");await refresh();
 }
 function persistTasks() { sessionStorage.setItem(pendingKey,JSON.stringify([...pending.values()].map(({ids,mode,label})=>({ids,mode,label})))); }
@@ -186,7 +190,11 @@ async function pollJobs() {
       const jobs=[];
       for(let i=0;i<task.ids.length;i+=50)jobs.push(...(await api("/api/jobs?ids="+encodeURIComponent(task.ids.slice(i,i+50).join(",")))).jobs);
       if(!signedIn)return;
-      if(jobs.length!==task.ids.length)throw new Error("任务记录不完整，请查看运行日志");
+      if(jobs.length!==task.ids.length){
+        pending.delete(key);persistTasks();task.resolve?.([]);
+        if(key===visibleTaskKey)$("taskDetail").textContent="部分账号已到期或删除，相关任务记录已清理。";
+        continue;
+      }
       const done=jobs.filter(job=>job.status==="done").length;
       if(key===visibleTaskKey) {
         $("taskTitle").textContent=task.label+(done===jobs.length?" · 已完成":` · ${done}/${jobs.length}`);
@@ -250,6 +258,50 @@ $("testNotify").addEventListener("click",async()=>{
   try{const result=await api(`/api/accounts/${encodeURIComponent(name)}/test-notify`,"POST",{});if(editingName===name)$("notifyTestState").textContent=result.result;await loadLogs();}
   catch(error){if(editingName===name)$("notifyTestState").textContent=error.message;}finally{if(editingName===name)$("testNotify").disabled=false;}
 });
+function hideGeneratedCodes(){ $("generatedCodes").hidden=true;$("codeOutput").value="";$("singleCodeCopies").replaceChildren(); }
+async function copyCodes(text){
+  try{await navigator.clipboard.writeText(text);toast("已复制，请妥善保存");}
+  catch{$("codeOutput").focus();$("codeOutput").select();toast("请手动复制选中的兑换码");}
+}
+async function loadCodeBatches(){
+  const data=await api("/api/redemption/batches");if(!signedIn)return;
+  $("codeBatchList").replaceChildren();$("codeBatchEmpty").hidden=data.batches.length>0;
+  const names={unused:"未使用",reserved:"验证中",used:"已使用",expired:"已过期",revoked:"已撤销"};
+  for(const batch of data.batches){
+    const item=element("details",undefined,"code-batch-item"),summary=element("summary"),heading=element("div");
+    heading.append(element("strong",batch.note||batch.school_name),element("small",`${batch.school_name} · ${batch.task_type===1?"签到":"查寝"} · ${batch.duration_seconds/3600}小时 · ${batch.quantity}个码`));
+    const used=batch.codes.filter(code=>code.used_at).length;summary.append(heading,badge(`${used}/${batch.quantity} 已使用`,used?"ok":"neutral"));item.append(summary);
+    item.append(element("p",`${batch.address} · ${batch.longitude}, ${batch.latitude}；最晚兑换：${batch.redeem_before?new Date(batch.redeem_before).toLocaleString():"不限"}`,"code-preset-detail"));
+    for(const code of batch.codes){
+      const row=element("div",undefined,"code-state-row");row.append(element("code","…"+code.suffix),badge(names[code.status]||code.status,code.status==="unused"?"ok":code.status==="reserved"?"warn":"neutral"));
+      row.append(element("span",code.authorization_until?"授权到期 "+new Date(code.authorization_until).toLocaleString():"尚未开通","code-dates"));
+      if(["unused","reserved"].includes(code.status))row.append(button("撤销",async()=>{
+        if(!await confirmAction("撤销兑换码？","撤销后不能继续兑换；正在验证的操作也不会开通。","撤销兑换码",true))return;
+        await api(`/api/redemption/codes/${code.id}/revoke`,"POST",{});await loadCodeBatches();toast("兑换码已撤销");
+      },"text-button danger-text"));
+      item.append(row);
+    }
+    $("codeBatchList").append(item);
+  }
+}
+$("showCodeForm").addEventListener("click",()=>{$("codeBatchForm").hidden=!$("codeBatchForm").hidden;});
+$("hideGeneratedCodes").addEventListener("click",hideGeneratedCodes);
+$("copyAllCodes").addEventListener("click",()=>copyCodes($("codeOutput").value));
+$("codeBatchForm").addEventListener("submit",async event=>{
+  event.preventDefault();$("codeBatchError").hidden=true;$("generateCodes").disabled=true;
+  try{
+    const quantity=Number($("codeQuantity").value);
+    if(!Number.isInteger(quantity)||quantity<1||quantity>10)throw new Error("数量必须为1～10的整数");
+    const result=await api("/api/redemption/batches","POST",{quantity,note:$("codeNote").value.trim(),schoolName:$("codeSchool").value.trim(),type:Number($("codeType").value),
+      lon:Number($("codeLon").value),lat:Number($("codeLat").value),address:$("codeAddress").value.trim(),durationValue:Number($("codeDuration").value),durationUnit:$("codeUnit").value,
+      redeemBefore:$("codeRedeemBefore").value?new Date($("codeRedeemBefore").value).getTime():null});
+    if(result.codes.length!==quantity||new Set(result.codes).size!==quantity||result.text.split("\n").length!==quantity)throw new Error("生成结果数量校对失败，请不要使用并联系管理员核查");
+    $("codeOutput").value=result.text;$("generatedCount").textContent=`已生成 ${quantity} 个兑换码（${quantity} 行）`;
+    $("singleCodeCopies").replaceChildren();result.codes.forEach((code,index)=>$("singleCodeCopies").append(button(`复制第${index+1}行`,()=>copyCodes(code))));
+    $("generatedCodes").hidden=false;$("codeBatchForm").hidden=true;await Promise.all([loadCodeBatches(),loadLogs()]);toast("兑换码已生成，请保存完整码");
+  }catch(error){$("codeBatchError").textContent=error.message;$("codeBatchError").hidden=false;}finally{$("generateCodes").disabled=false;}
+});
+$("codeSchool").addEventListener("input",event=>{const query=event.target.value.trim();$("codeSchoolOptions").replaceChildren();if(query)for(const name of (window.SCHOOL_LIST||[]).filter(value=>value.includes(query)).slice(0,30)){const option=element("option");option.value=name;$("codeSchoolOptions").append(option);}});
 $("loginForm").addEventListener("submit",async event=>{
   event.preventDefault();$("loginSubmit").disabled=true;$("loginError").hidden=true;
   try{const identity=await api("/api/auth/login","POST",{username:$("loginUsername").value.trim(),password:$("loginPassword").value},true);await showApp(identity);}
@@ -284,7 +336,7 @@ for(const button of document.querySelectorAll("[data-filter]"))button.addEventLi
 $("accountSchool").addEventListener("input",event=>{const query=event.target.value.trim();$("schoolOptions").replaceChildren();if(query)for(const name of (window.SCHOOL_LIST||[]).filter(value=>value.includes(query)).slice(0,30)){const option=element("option");option.value=name;$("schoolOptions").append(option);}});
 $("dismissResult").addEventListener("click",()=>$("taskResult").hidden=true);
 setInterval(()=>{if(signedIn&&!document.hidden)pollJobs();},3000);
-setInterval(()=>{if(signedIn&&!document.hidden)Promise.all([loadStatus(),loadLogs()]).catch(showError);},60000);
+setInterval(()=>{if(signedIn&&!document.hidden)Promise.all([loadStatus(),loadLogs(),loadAccounts(),loadCodeBatches()]).catch(showError);},60000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&signedIn)pollJobs();});
 (async()=>{
   try { localStorage.removeItem("jrxy_web_token");localStorage.removeItem("jrxy_cf_token"); } catch {}
