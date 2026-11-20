@@ -1,5 +1,13 @@
 // 对齐 web-server/app.py: classify / notify_head / send_notify / run_and_report。
-import { type Account, type Result, LABELS } from "./types";
+import { AppError, type Account, type Result, LABELS } from "./types";
+
+export function enrollmentNotify(body:Record<string,unknown>):{method:number;rcvOption:string} {
+  if(body.notifyEnabled!==undefined&&typeof body.notifyEnabled!=="boolean")throw new AppError("通知开关必须为布尔值");
+  if(body.notifyEnabled!==true)return {method:0,rcvOption:""};
+  const key=body.sendKey;
+  if(typeof key!=="string"||!/^SCT[A-Za-z0-9_-]{10,253}$/.test(key.trim())||/[\r\n]/.test(key))throw new AppError("请输入有效的SCT开头的Server酱SendKey，不支持推送网址");
+  return {method:2,rcvOption:key.trim()};
+}
 import { redact } from "./security";
 
 export function notifyOption(account: Account): { method: number; rcvOption: string } {

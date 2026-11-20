@@ -61,15 +61,32 @@ export function responseCookies(headers: Headers): string[] {
   if(!headers.has("Set-Cookie"))return [];
   throw new Error("Runtime does not support separate Set-Cookie values");
 }
+async function beforeDeadline<T>(deadline: number, work: () => Promise<T>, expired: () => EngineError): Promise<T> {
+  const left = deadline - Date.now();
+  if (left <= 0) throw expired();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(expired()), left); });
+    const value = await Promise.race([timeout, work()]);
+    if (Date.now() >= deadline) throw expired();
+    return value;
+  } finally { if (timer !== undefined) clearTimeout(timer); }
+}
+function discardBody(response?: Response, reader?: ReadableStreamDefaultReader<Uint8Array>): void {
+  // 取消是尽力清理；异常上游不能通过卡住cancel()拖过总时限。
+  try { void (reader ? reader.cancel() : response?.body?.cancel())?.catch(() => {}); } catch {}
+}
 export interface HttpResult { status: number; url: string; headers: Headers; text: string; }
 export class Session {
   readonly jar = new CookieJar();
   private count = 0;
   private deadline: number;
+  private startedAt: number;
   private stage: RequestStage = "request";
   private last?: Omit<RequestDiagnostic,"stage"|"kind">;
   constructor(private transport: typeof fetch = fetch, private timeoutMs = 30_000, runTimeoutMs = 300_000) {
-    this.deadline = Date.now() + runTimeoutMs;
+    this.startedAt=Date.now();
+    this.deadline = this.startedAt + runTimeoutMs;
   }
   at(stage: RequestStage): this { this.stage=stage;return this; }
   diagnostic(kind: RequestDiagnostic["kind"]): RequestDiagnostic { return {...this.last,stage:this.stage,kind}; }
@@ -87,55 +104,80 @@ export class Session {
     if(!headers.has("User-Agent"))headers.set("User-Agent", LOGIN_UA);
     for (let hop = 0; hop <= 10; hop++) {
       const started=Date.now();
-      this.last={host:url.hostname,method:["GET","POST","HEAD"].includes(method)?method as "GET"|"POST"|"HEAD":undefined,elapsedMs:0};
-      if (++this.count > 40) throw this.failure("本次任务请求数过多，已停止","request_limit");
-      const left = this.deadline - started;
-      if (left <= 0) throw this.failure("任务网络总时限已到","total_timeout",true);
+      const timing: Omit<RequestDiagnostic,"stage"|"kind"> = {host:url.hostname,method:["GET","POST","HEAD"].includes(method)?method as "GET"|"POST"|"HEAD":undefined,
+        phase:"send",requestIndex:++this.count,redirectCount:hop,timeoutMs,receivedBytes:0};
+      this.last=timing;
+      let lastProgress=started;
+      const recordTime=()=>{
+        const now=Date.now();
+        timing.elapsedMs=Math.max(0,now-started);
+        timing.sessionElapsedMs=Math.max(0,now-this.startedAt);
+        timing.idleMs=Math.max(0,now-lastProgress);
+      };
+      const waitForProgress=<T>(work:()=>Promise<T>):Promise<T>=>{
+        const idleDeadline=lastProgress+timeoutMs;
+        const total=this.deadline<=idleDeadline;
+        return beforeDeadline(Math.min(this.deadline,idleDeadline),work,()=>{
+          recordTime();
+          if(total)return this.failure("任务网络总时限已到","total_timeout",true);
+          return this.failure(timing.phase==="send"?"等待上游首次响应超时":"上游正文无读取进展，已超时","timeout",true);
+        });
+      };
+      if (this.count > 40) { recordTime();throw this.failure("本次任务请求数过多，已停止","request_limit"); }
       const h = new Headers(headers);
       const cookie=this.jar.header(url);
       if(cookie)h.set("Cookie",cookie);else h.delete("Cookie");
       if (options.headers && new Headers(options.headers).has("Cookie") && hop === 0) h.set("Cookie", new Headers(options.headers).get("Cookie")!);
       const abort = new AbortController();
-      const timer = setTimeout(() => abort.abort(), Math.min(timeoutMs, left));
-      let result: HttpResult;
-      let phase: NonNullable<RequestDiagnostic["phase"]>="send";
+      let result: HttpResult, response: Response | undefined, reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      let drained=false;
       try {
         // bytes避免fetch给原本无Content-Type的IAP字符串正文自动加text/plain。
         const wireBody=typeof body==="string"&&!h.has("Content-Type")?new TextEncoder().encode(body):body;
-        this.last.phase=phase;
         // 原生fetch不能以Session为this调用，否则workerd会在发出请求前抛Illegal invocation。
         const transport=this.transport;
-        const response = await transport(url.href, { method, body:wireBody, headers: h, redirect: "manual", signal: abort.signal });
-        phase="headers";this.last.phase=phase;
-        this.last.httpStatus=response.status;
-        for (const value of responseCookies(response.headers)) this.jar.set(value, url);
-        phase="body";this.last.phase=phase;
-        const reader = response.body?.getReader();
+        const received=await waitForProgress(async()=>{
+          const next=await transport(url.href,{method,body:wireBody,headers:h,redirect:"manual",signal:abort.signal});
+          if(abort.signal.aborted)discardBody(next);else response=next;
+          return next;
+        });
+        lastProgress=Date.now();
+        timing.phase="headers";timing.httpStatus=received.status;
+        for (const value of responseCookies(received.headers)) this.jar.set(value, url);
+        timing.phase="body";
+        reader=received.body?.getReader();
         const chunks: Uint8Array[] = [];
         let size = 0;
-        if (reader) for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          size += value.byteLength;
-          if (size > 2 * 1024 * 1024) { await reader.cancel(); throw new EngineError("上游响应过大"); }
-          chunks.push(value);
+        if (reader) {
+          const currentReader=reader;
+          for (;;) {
+            const { value, done } = await waitForProgress(()=>currentReader.read());
+            if (done) break;
+            if (!value.byteLength) continue;
+            lastProgress=Date.now();
+            size+=value.byteLength;timing.receivedBytes=size;
+            if (size > 2 * 1024 * 1024) throw new EngineError("上游响应过大");
+            chunks.push(value);
+          }
         }
-        phase="decode";this.last.phase=phase;
+        drained=true;timing.phase="decode";
         const bytes = new Uint8Array(size);
         let offset = 0;
         for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-        result = { status: response.status, url: url.href, headers: response.headers, text: new TextDecoder().decode(bytes) };
+        result = { status: received.status, url: url.href, headers: received.headers, text: new TextDecoder().decode(bytes) };
       } catch (e) {
-        this.last.elapsedMs=Math.max(0,Date.now()-started);
+        recordTime();
         if (e instanceof EngineError) { e.diagnostic??=this.diagnostic("response");throw e; }
-        if(abort.signal.aborted)throw this.failure("上游请求超时",left<=timeoutMs?"total_timeout":"timeout",true);
-        if(phase==="send"&&e instanceof TypeError&&e.message.startsWith("Illegal invocation"))
+        if(timing.phase==="send"&&e instanceof TypeError&&e.message.startsWith("Illegal invocation"))
           throw this.failure("Worker请求函数调用异常，尚未发出请求；请联系管理员检查部署版本","internal");
-        if(phase==="send")throw this.failure("发送上游请求失败，尚未取得响应（DNS、TLS或连接原因待核实）","transport",true);
-        if(phase==="body")throw this.failure("已取得响应，但读取正文失败","body_read",true);
+        if(timing.phase==="send")throw this.failure("发送上游请求失败，尚未取得响应（DNS、TLS或连接原因待核实）","transport",true);
+        if(timing.phase==="body")throw this.failure("已取得响应，但读取正文失败","body_read",true);
         throw this.failure("已取得响应，但处理响应头或内容失败；请查看管理员诊断","response_processing");
-      } finally { clearTimeout(timer); }
-      this.last.elapsedMs=Math.max(0,Date.now()-started);
+      } finally {
+        if(!drained){discardBody(response,reader);abort.abort();}
+        reader?.releaseLock();
+      }
+      recordTime();
       if (result.status === 418 || result.status === 429) throw this.failure("上游限制访问，请停止自动执行并检查账号/网络","http");
       if (follow && [301, 302, 303, 307, 308].includes(result.status) && result.headers.has("location")) {
         let next: URL;

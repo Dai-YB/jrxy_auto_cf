@@ -5,7 +5,9 @@ const modes = {dry:"探测",submit:"签到",login:"登录测试",range:"范围�
 const pendingKey = "jrxy_pending_jobs_v2";
 let csrfToken = "", signedIn = false, editingName = "", originalDevice = "", accounts = [], filter = "all";
 let toastTimer, pollBusy = false, confirmResolve, visibleTaskKey = "", scheduleDirty = false;
-const pending = new Map();
+const pending = new Map(), selectedAccounts=new Set();
+let executionDirty=false,codeCursors=[null],codePage=0,codeNextCursor=null,codeLoading=false;
+function visibleAccounts(){const query=$("accountSearch").value.trim().toLocaleLowerCase();return accounts.filter(account=>(filter==="all"||(filter==="paused"?account.paused:!account.paused))&&[account.name,account.displayName,account.schoolName,account.username].some(value=>String(value??"").toLocaleLowerCase().includes(query)));}
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -45,7 +47,7 @@ async function api(path,method="GET",body,login=false) {
   return data;
 }
 function showLogin() {
-  signedIn=false;csrfToken="";accounts=[];editingName="";scheduleDirty=false;
+  signedIn=false;csrfToken="";accounts=[];editingName="";scheduleDirty=false;executionDirty=false;selectedAccounts.clear();codeCursors=[null];codePage=0;codeNextCursor=null;
   for(const task of pending.values())task.reject?.(Object.assign(new Error("登录已过期，请重新登录"),{status:401}));
   pending.clear();
   for(const dialog of [$("accountDialog"),$("confirmDialog")])if(dialog.open)dialog.close();
@@ -100,18 +102,23 @@ async function loadStatus(updateForm=false) {
   $("scheduleNote").textContent=status.scheduler.enabled?"下次执行："+status.scheduler.next+"（"+status.timezone+"）":"当前未开启自动签到";
   $("lastRun").textContent=status.scheduler.last_run?"上次："+status.scheduler.last_run+" · "+status.scheduler.last_result:"";
   if(updateForm||!scheduleDirty){$("scheduleEnabled").checked=status.scheduler.enabled;$("scheduleInput").value=status.scheduler.time;}
+  if(updateForm||!executionDirty)$("parallelism").value=String(status.execution.parallelism);
+  $("executionState").textContent=`运行 ${status.execution.active} / ${status.execution.parallelism} · 等待 ${status.execution.waiting}`;
   $("connectionState").replaceChildren(element("i"),document.createTextNode("已连接"));
 }
 async function loadAccounts() {
   const result=await api("/api/accounts");if(!signedIn)return;
-  accounts=result.accounts;renderAccounts();
+  accounts=result.accounts;for(const name of selectedAccounts)if(!accounts.some(account=>account.name===name))selectedAccounts.delete(name);renderAccounts();
 }
 function accountLabel(account) { return account.displayName||account.name; }
 function accountName(name) { const account=accounts.find(item=>item.name===name);return account?accountLabel(account):name; }
 function identity(account) {
   const block=element("div",undefined,"account-identity");
-  block.append(element("span",accountLabel(account).slice(0,1),"account-avatar"));
+  const select=element("input",undefined,"account-select");select.type="checkbox";select.checked=selectedAccounts.has(account.name);select.setAttribute("aria-label",`选择 ${accountLabel(account)} ${account.username}`);
+  select.addEventListener("change",()=>{if(select.checked)selectedAccounts.add(account.name);else selectedAccounts.delete(account.name);renderAccounts();});
+  block.append(select,element("span",accountLabel(account).slice(0,1),"account-avatar"));
   const info=element("div");info.append(element("b",accountLabel(account)),element("small",account.schoolName),element("small",account.username,"student"));
+  info.append(element("small",(account.priority>0?"优先 · ":"")+"权重 "+(account.priority||0),"priority-label"));
   if(account.authorization_until)info.append(element("small","有效至 "+new Date(account.authorization_until).toLocaleString(),"grant-expiry"));
   block.append(info);return block;
 }
@@ -124,9 +131,11 @@ function accountActions(account,mobile=false) {
   return actions;
 }
 function renderAccounts() {
-  const query=$("accountSearch").value.trim().toLocaleLowerCase();
-  const visible=accounts.filter(account=>(filter==="all"||(filter==="paused"?account.paused:!account.paused))&&
-    [account.name,account.displayName,account.schoolName,account.username].some(value=>String(value).toLocaleLowerCase().includes(query)));
+  const visible=visibleAccounts().sort((a,b)=>(b.priority||0)-(a.priority||0));
+  $("selectedCount").textContent=`已选${selectedAccounts.size}个`;
+  $("applyPriority").disabled=!selectedAccounts.size;
+  $("selectAccounts").checked=visible.length>0&&visible.every(account=>selectedAccounts.has(account.name));
+  $("selectAccounts").indeterminate=visible.some(account=>selectedAccounts.has(account.name))&&!$("selectAccounts").checked;
   $("listCount").textContent=String(accounts.length);$("accountRows").replaceChildren();$("accountCards").replaceChildren();
   $("accountEmpty").hidden=visible.length>0;
   $("accountEmpty").querySelector("h3").textContent=accounts.length?"没有匹配的账号":"还没有账号";
@@ -145,6 +154,21 @@ function renderAccounts() {
   $("batchHint").textContent=accounts.length?`${active} 个正常账号 · ${accounts.length-active} 个已暂停` : "先添加账号，再进行探测或签到。";
   $("batchDry").disabled=!accounts.length;$("batchSubmit").disabled=!active;
 }
+$("selectAccounts").addEventListener("change",()=>{for(const account of visibleAccounts())if($("selectAccounts").checked)selectedAccounts.add(account.name);else selectedAccounts.delete(account.name);renderAccounts();});
+$("priorityForm").addEventListener("submit",async event=>{
+  event.preventDefault();const names=[...selectedAccounts],priority=Number($("batchPriority").value);if(!names.length)return;
+  if(!Number.isInteger(priority)||priority<0||priority>100){showError(new Error("权重必须为0～100的整数"));return;}
+  if(names.length>100){showError(new Error("每次最多设置100个账号"));return;}
+  if(!await confirmAction("批量设置签到权重？",`将${names.length}个账号的权重设为${priority}。数值越大越优先；只影响之后创建的批次。`,"保存权重"))return;
+  $("applyPriority").disabled=true;
+  try{const result=await api("/api/accounts/priority/batch","POST",{names,priority});selectedAccounts.clear();await loadAccounts();toast(`已更新${result.updated}个账号的权重`);}catch(error){showError(error);}finally{renderAccounts();}
+});
+$("parallelism").addEventListener("change",()=>executionDirty=true);
+$("executionForm").addEventListener("submit",async event=>{
+  event.preventDefault();const submit=event.currentTarget.querySelector('button[type="submit"]'),parallelism=Number($("parallelism").value);
+  if(!await confirmAction("保存并发上限？",`最多同时执行${parallelism}个学校账号任务，仍受免费额度和学校限制。已开始任务自然结束，不修改每日计划开关。`,"保存执行设置"))return;
+  submit.disabled=true;try{await api("/api/execution","POST",{parallelism});executionDirty=false;await loadStatus();toast("执行设置已保存");}catch(error){showError(error);}finally{submit.disabled=false;}
+});
 async function loadLogs() {
   const result=await api("/api/logs?limit=100");if(!signedIn)return;
   $("logList").replaceChildren();$("logEmpty").hidden=result.logs.length>0;
@@ -165,11 +189,25 @@ async function loadEnrollments(){
   const kinds={timeout:"单次请求超时",total_timeout:"总网络时限已到",transport:"发送失败，未取得响应（DNS / TLS / 连接原因待核实）",body_read:"已取得响应，正文读取中断",response_processing:"已取得响应，响应头或内容处理错误",http:"上游HTTP异常",response:"响应或登录校验未通过",request_limit:"请求次数超限",redirect_limit:"重定向次数超限",policy:"地址或跨域请求不符合安全规则",internal:"内部处理异常"};
   for(const attempt of data.attempts){
     const item=element("details",undefined,"log-entry"),summary=element("summary"),info=element("div",undefined,"log-text");
-    info.append(element("b","兑换码 …"+attempt.suffix),element("small",attempt.createdAt+"（"+attempt.timezone+"）"));
+    info.append(element("b","授权码 …"+attempt.suffix),element("small",attempt.createdAt+"（"+attempt.timezone+"）"));
     summary.append(info,badge(states[attempt.status]||attempt.status,attempt.status==="failed"?"bad":attempt.status==="succeeded"?"ok":"warn"));item.append(summary);
     const d=attempt.diagnostic,lines=[attempt.message||states[attempt.status]||attempt.status];
-    const phases={send:"发送请求，尚未取得响应",headers:"处理响应头与Cookie",body:"读取响应正文",decode:"解码响应正文",json:"解析JSON响应"};
-    if(d){lines.push("阶段："+(stages[d.stage]||"未知"),"分类："+(kinds[d.kind]||"未知"));if(d.phase)lines.push("处理环节："+(phases[d.phase]||"未知"));if(d.host)lines.push("目标域名："+d.host);if(d.method)lines.push("方法："+d.method);if(d.httpStatus)lines.push("HTTP："+d.httpStatus);if(d.elapsedMs!=null)lines.push("请求耗时："+d.elapsedMs+" ms");}
+    const phases={send:"发送请求并等待首次响应",headers:"处理响应头与Cookie",body:"读取响应正文",decode:"解码响应正文",json:"解析JSON响应"};
+    if(d){
+      const kind=d.kind==="timeout"&&d.timeoutMs!=null?(d.phase==="send"?"等待首次响应超时":d.phase==="body"?"正文无读取进展超时":kinds.timeout):kinds[d.kind];
+      lines.push("阶段："+(stages[d.stage]||"未知"),"分类："+(kind||"未知"));
+      if(d.phase)lines.push("处理环节："+(phases[d.phase]||"未知"));
+      if(d.host)lines.push("目标域名："+d.host);
+      if(d.method)lines.push("方法："+d.method);
+      if(d.httpStatus)lines.push("HTTP："+d.httpStatus);
+      if(d.requestIndex!=null)lines.push("请求序号："+d.requestIndex);
+      if(d.redirectCount!=null)lines.push("本次跳转次数："+d.redirectCount);
+      if(d.elapsedMs!=null)lines.push("请求耗时："+d.elapsedMs+" ms");
+      if(d.sessionElapsedMs!=null)lines.push("会话累计耗时："+d.sessionElapsedMs+" ms");
+      if(d.timeoutMs!=null)lines.push("等待阈值："+d.timeoutMs+" ms（仍受总时限约束）");
+      if(d.idleMs!=null)lines.push("距上次响应进展："+d.idleMs+" ms");
+      if(d.receivedBytes!=null)lines.push("已读取正文："+d.receivedBytes+" 字节");
+    }
     else if(attempt.status==="failed")lines.push("没有详细诊断；旧版本记录或验证已被撤销/中断。");
     item.append(element("pre",lines.join("\n")));$("enrollmentList").append(item);
   }
@@ -184,7 +222,7 @@ async function togglePaused(account) {
   await refresh();await pollJobs();
 }
 async function removeAccount(account) {
-  const note=account.source==="redemption"?"该兑换账号的凭据、设备绑定与关联记录将被删除，兑换码不会恢复可用。":"账号配置将删除，设备绑定仍会保留。";
+  const note=account.source==="redemption"?"该授权账号的凭据、设备绑定与关联记录将被删除，授权码不会恢复可用。":"账号配置将删除，设备绑定仍会保留。";
   if(!await confirmAction("删除账号？",`删除「${accountLabel(account)}」（${account.username}）？${note}此操作不能撤销。`,"删除账号",true))return;
   await api("/api/accounts/"+encodeURIComponent(account.name),"DELETE");toast("账号已删除");await refresh();
 }
@@ -242,7 +280,7 @@ async function openAccount(name="") {
   $("accountDialog").querySelector(".advanced-fields").open=false;
   if(name){
     const account=await api("/api/accounts/"+encodeURIComponent(name));if(!signedIn)return;
-    for(const key of ["name","schoolName","type","username","deviceId","lon","lat","address","abnormalReason","checkTitle","httpProxy"])field(key).value=account[key]??"";
+    for(const key of ["name","schoolName","type","username","deviceId","priority","lon","lat","address","abnormalReason","checkTitle","httpProxy"])field(key).value=account[key]??"";
     field("name").value=accountLabel(account);
     field("notifyMethod").value=String(account.notify_method||0);field("notifyRcv").value=account.notify_rcv||"";originalDevice=account.deviceId;
   }
@@ -283,31 +321,52 @@ $("testNotify").addEventListener("click",async()=>{
   catch(error){if(editingName===name)$("notifyTestState").textContent=error.message;}finally{if(editingName===name)$("testNotify").disabled=false;}
 });
 function hideGeneratedCodes(){ $("generatedCodes").hidden=true;$("codeOutput").value="";$("singleCodeCopies").replaceChildren(); }
+function showCodes(result,label){
+  if(!Array.isArray(result.codes)||result.codes.length!==result.quantity||result.quantity<1||result.quantity>10||new Set(result.codes).size!==result.quantity||result.text!==result.codes.join("\n"))throw new Error("授权码数量校对失败，请刷新后核实");
+  $("codeOutput").value=result.text;$("generatedCount").textContent=`${label} ${result.quantity} 个授权码（${result.quantity} 行）`;
+  $("singleCodeCopies").replaceChildren();result.codes.forEach((code,index)=>$("singleCodeCopies").append(button(`复制第${index+1}行`,()=>copyCodes(code))));$("generatedCodes").hidden=false;
+}
 async function copyCodes(text){
   try{await navigator.clipboard.writeText(text);toast("已复制，请妥善保存");}
-  catch{$("codeOutput").focus();$("codeOutput").select();toast("请手动复制选中的兑换码");}
+  catch{showCodes({quantity:text.split("\n").length,codes:text.split("\n"),text},"待复制");$("codeOutput").focus();$("codeOutput").select();toast("请手动复制选中的授权码");}
 }
+async function recoverCodes(kind,id){const result=await api(`/api/redemption/${kind}/${id}/copy`,"POST",{});if(!signedIn)return;showCodes(result,"可复制");await copyCodes(result.text);}
 async function loadCodeBatches(){
-  const data=await api("/api/redemption/batches");if(!signedIn)return;
+  if(codeLoading)return;codeLoading=true;
+  try{
+  const cursor=codeCursors[codePage];const data=await api("/api/redemption/batches"+(cursor?"?cursor="+encodeURIComponent(cursor):""));if(!signedIn)return;
+  codeNextCursor=data.nextCursor;$("codePrevious").disabled=codePage===0;$("codeNext").disabled=!codeNextCursor;$("codePageLabel").textContent=`第${codePage+1}页 · 每页10条`;
+  const openBatches=new Set([...$("codeBatchList").querySelectorAll("details[open]")].map(item=>item.dataset.batchId));
   $("codeBatchList").replaceChildren();$("codeBatchEmpty").hidden=data.batches.length>0;
   const names={unused:"未使用",reserved:"验证中",used:"已使用",expired:"已过期",revoked:"已撤销"};
   for(const batch of data.batches){
-    const item=element("details",undefined,"code-batch-item"),summary=element("summary"),heading=element("div");
+    const item=element("details",undefined,"code-batch-item"),summary=element("summary"),heading=element("div");item.dataset.batchId=batch.id;item.open=openBatches.has(batch.id);
     heading.append(element("strong",batch.note||batch.school_name),element("small",`${batch.school_name} · ${batch.task_type===1?"签到":"查寝"} · ${batch.duration_seconds/3600}小时 · ${batch.quantity}个码`));
-    const used=batch.codes.filter(code=>code.used_at).length;summary.append(heading,badge(`${used}/${batch.quantity} 已使用`,used?"ok":"neutral"));item.append(summary);
-    item.append(element("p",`${batch.address} · ${batch.longitude}, ${batch.latitude}；最晚兑换：${batch.redeem_before?new Date(batch.redeem_before).toLocaleString():"不限"}`,"code-preset-detail"));
+    summary.append(heading,badge(`${batch.used}/${batch.quantity} 已使用`,batch.used?"ok":"neutral"));item.append(summary);
+    item.append(element("p",`${batch.address} · ${batch.longitude}, ${batch.latitude}；最晚使用：${batch.redeem_before?new Date(batch.redeem_before).toLocaleString():"不限"}；本页${batch.codes.length}条，整批${batch.quantity}条`,"code-preset-detail"));
+    const batchActions=element("div",undefined,"code-batch-actions");
+    batchActions.append(button("复制本批未使用码",()=>recoverCodes("batches",batch.id)));
+    if(batch.revocable)batchActions.append(button("撤销本批未使用码",async()=>{
+      if(!await confirmAction("整批撤销授权码？",`撤销本批${batch.revocable}个尚未使用的码（包括验证中），不仅限于本页。已开通账号不受影响。`,"整批撤销",true))return;
+      const result=await api(`/api/redemption/batches/${batch.id}/revoke`,"POST",{});hideGeneratedCodes();await loadCodeBatches();toast(`已撤销${result.revoked}个授权码`);
+    },"danger-text"));item.append(batchActions);
     for(const code of batch.codes){
       const row=element("div",undefined,"code-state-row");row.append(element("code","…"+code.suffix),badge(names[code.status]||code.status,code.status==="unused"?"ok":code.status==="reserved"?"warn":"neutral"));
       row.append(element("span",code.authorization_until?"授权到期 "+new Date(code.authorization_until).toLocaleString():"尚未开通","code-dates"));
+      if(code.copyable)row.append(button("复制",()=>recoverCodes("codes",code.id),"text-button"));
+      else if(code.status==="unused"&&!code.recoverable)row.append(element("small","旧版摘要，无法恢复原文","field-note"));
       if(["unused","reserved"].includes(code.status))row.append(button("撤销",async()=>{
-        if(!await confirmAction("撤销兑换码？","撤销后不能继续兑换；正在验证的操作也不会开通。","撤销兑换码",true))return;
-        await api(`/api/redemption/codes/${code.id}/revoke`,"POST",{});await loadCodeBatches();toast("兑换码已撤销");
+        if(!await confirmAction("撤销授权码？","撤销后不能继续授权；正在验证的操作也不会开通。","撤销授权码",true))return;
+        await api(`/api/redemption/codes/${code.id}/revoke`,"POST",{});hideGeneratedCodes();await loadCodeBatches();toast("授权码已撤销");
       },"text-button danger-text"));
       item.append(row);
     }
     $("codeBatchList").append(item);
   }
+  }finally{codeLoading=false;}
 }
+$("codePrevious").addEventListener("click",()=>{if(codeLoading||codePage===0)return;codePage--;loadCodeBatches().catch(showError);});
+$("codeNext").addEventListener("click",()=>{if(codeLoading||!codeNextCursor)return;codeCursors[codePage+1]=codeNextCursor;codePage++;loadCodeBatches().catch(showError);});
 $("showCodeForm").addEventListener("click",()=>{$("codeBatchForm").hidden=!$("codeBatchForm").hidden;});
 $("hideGeneratedCodes").addEventListener("click",hideGeneratedCodes);
 $("copyAllCodes").addEventListener("click",()=>copyCodes($("codeOutput").value));
@@ -319,10 +378,10 @@ $("codeBatchForm").addEventListener("submit",async event=>{
     const result=await api("/api/redemption/batches","POST",{quantity,note:$("codeNote").value.trim(),schoolName:$("codeSchool").value.trim(),type:Number($("codeType").value),
       lon:Number($("codeLon").value),lat:Number($("codeLat").value),address:$("codeAddress").value.trim(),durationValue:Number($("codeDuration").value),durationUnit:$("codeUnit").value,
       redeemBefore:$("codeRedeemBefore").value?new Date($("codeRedeemBefore").value).getTime():null});
+    if(!signedIn)return;
     if(result.codes.length!==quantity||new Set(result.codes).size!==quantity||result.text.split("\n").length!==quantity)throw new Error("生成结果数量校对失败，请不要使用并联系管理员核查");
-    $("codeOutput").value=result.text;$("generatedCount").textContent=`已生成 ${quantity} 个兑换码（${quantity} 行）`;
-    $("singleCodeCopies").replaceChildren();result.codes.forEach((code,index)=>$("singleCodeCopies").append(button(`复制第${index+1}行`,()=>copyCodes(code))));
-    $("generatedCodes").hidden=false;$("codeBatchForm").hidden=true;await Promise.all([loadCodeBatches(),loadLogs()]);toast("兑换码已生成，请保存完整码");
+    showCodes(result,"已生成");codeCursors=[null];codePage=0;
+    $("codeBatchForm").hidden=true;await Promise.all([loadCodeBatches(),loadLogs()]);toast("授权码已生成，未使用前可再次复制");
   }catch(error){$("codeBatchError").textContent=error.message;$("codeBatchError").hidden=false;}finally{$("generateCodes").disabled=false;}
 });
 $("codeSchool").addEventListener("input",event=>{const query=event.target.value.trim();$("codeSchoolOptions").replaceChildren();if(query)for(const name of (window.SCHOOL_LIST||[]).filter(value=>value.includes(query)).slice(0,30)){const option=element("option");option.value=name;$("codeSchoolOptions").append(option);}});

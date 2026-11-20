@@ -61,6 +61,21 @@ export function buildAccount(body: Record<string, unknown>, old?: Account): Acco
   if (body.photo) throw new AppError("照片功能按要求已移除");
   return account;
 }
+export function accountPriority(value:unknown):number {
+  const n=typeof value==="string"&&value.trim()!==""?Number(value):value;
+  if(typeof n!=="number"||!Number.isInteger(n)||n<0||n>100)throw new AppError("签到权重必须为0～100的整数，数值越大越优先");
+  return n;
+}
+export async function setPriorities(env:Env,body:Record<string,unknown>):Promise<{updated:number}> {
+  const names=body.names,priority=accountPriority(body.priority);
+  if(!Array.isArray(names)||names.length<1||names.length>100||names.some(name=>typeof name!=="string"||!validName(name)))throw new AppError("请选择1～100个有效账号");
+  const rows=await env.DB.batch([
+    env.DB.prepare(`UPDATE accounts SET priority=? WHERE name IN(SELECT value FROM json_each(?)) AND deleted=0 AND (authorization_until IS NULL OR authorization_until>?) RETURNING name`)
+      .bind(priority,JSON.stringify([...new Set(names)]),Date.now()),
+    env.DB.prepare("INSERT INTO sign_log(ts,kind,result,detail) VALUES(?,'账号权重','优先级已更新',?)").bind(Date.now(),`权重${priority}，仅影响新建批次`)
+  ]);
+  return {updated:rows[0].results.length};
+}
 export async function getAccount(env: Env, name: string): Promise<{ row: AccountRow; account: Account }> {
   const row = await env.DB.prepare("SELECT * FROM accounts WHERE name=? AND deleted=0").bind(name).first<AccountRow>();
   if (!row) throw new AppError("账号不存在", 404);
@@ -71,7 +86,7 @@ export function publicAccount(row: AccountRow, account: Account): Record<string,
   const { password, notifyKey, notifyOption: hiddenNotify, ...rest } = account;
   const option = notifyOption(account);
   return { ...rest, name: row.name, deviceId: row.device_id, device_id: row.device_id,
-    school: account.schoolName, paused:Boolean(row.paused), authorization_until:row.authorization_until ?? null, source:row.grant_code_id?"redemption":"admin", username_set: Boolean(account.username), password_set: Boolean(password),
+    school: account.schoolName, priority:row.priority??0, paused:Boolean(row.paused), authorization_until:row.authorization_until ?? null, source:row.grant_code_id?"redemption":"admin", username_set: Boolean(account.username), password_set: Boolean(password),
     notify_set: Boolean(option.rcvOption), notify_method: option.method, notify_rcv: option.rcvOption };
 }
 export async function listAccounts(env: Env): Promise<Record<string, unknown>[]> {
@@ -85,9 +100,10 @@ export async function saveAccount(env: Env, name: string, body: Record<string, u
   if (!create && (!old || old.deleted)) throw new AppError("账号不存在", 404);
   const oldConfig = old && !old.deleted ? await unseal<Account>(old.config, env.ENCRYPTION_KEY, `account:${name}`) : undefined;
   const account = buildAccount(body, oldConfig);
+  const priority="priority" in body?accountPriority(body.priority):old?.priority??0;
   if(old && !old.deleted && !accountValid(old))throw new AppError("账号授权已到期，不能编辑或重新激活",410);
   if(old?.grant_code_id && oldConfig && (account.schoolName!==oldConfig.schoolName || account.username!==oldConfig.username))
-    throw new AppError("兑换账号不能更换绑定学校或账号");
+    throw new AppError("授权账号不能更换绑定学校或账号");
   const identity = identityKey(env,account.schoolName,account.username);
   const duplicate = await env.DB.prepare("SELECT name FROM accounts WHERE identity_key=? AND name!=? AND deleted=0 AND (authorization_until IS NULL OR authorization_until>?) LIMIT 1")
     .bind(identity,name,Date.now()).first();
@@ -98,19 +114,19 @@ export async function saveAccount(env: Env, name: string, body: Record<string, u
   const deviceId = initializeDeviceId(device, old?.device_id ?? prior?.device_id);
   const config = await seal(account, env.ENCRYPTION_KEY, `account:${name}`);
   if (create) {
-    const saved = await env.DB.prepare(`INSERT INTO accounts(name,config,device_id,created_at,identity_key)
-      SELECT ?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM accounts a WHERE a.identity_key=? AND a.name!=? AND a.deleted=0)
-      ON CONFLICT(name) DO UPDATE SET config=excluded.config,device_id=excluded.device_id,identity_key=excluded.identity_key,deleted=0 WHERE accounts.deleted=1 AND accounts.grant_code_id IS NULL RETURNING name`)
-      .bind(name, config, deviceId, Date.now(),identity,identity,name).first();
+    const saved = await env.DB.prepare(`INSERT INTO accounts(name,config,device_id,created_at,identity_key,priority)
+      SELECT ?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM accounts a WHERE a.identity_key=? AND a.name!=? AND a.deleted=0)
+      ON CONFLICT(name) DO UPDATE SET config=excluded.config,device_id=excluded.device_id,identity_key=excluded.identity_key,priority=excluded.priority,deleted=0 WHERE accounts.deleted=1 AND accounts.grant_code_id IS NULL RETURNING name`)
+      .bind(name, config, deviceId, Date.now(),identity,priority,identity,name).first();
     if (!saved) throw new AppError("账号名已存在", 409);
   } else {
-    const saved = await env.DB.prepare(`UPDATE accounts SET config=?,device_id=?,identity_key=? WHERE name=? AND deleted=0 AND (authorization_until IS NULL OR authorization_until>?) AND NOT EXISTS
+    const saved = await env.DB.prepare(`UPDATE accounts SET config=?,device_id=?,identity_key=?,priority=? WHERE name=? AND deleted=0 AND (authorization_until IS NULL OR authorization_until>?) AND NOT EXISTS
       (SELECT 1 FROM jobs WHERE account=? AND (status!='done' OR report_pending=1))
-      AND NOT EXISTS(SELECT 1 FROM accounts a WHERE a.identity_key=? AND a.name!=? AND a.deleted=0) RETURNING name`).bind(config, deviceId, identity,name,Date.now(),name,identity,name).first();
+      AND NOT EXISTS(SELECT 1 FROM accounts a WHERE a.identity_key=? AND a.name!=? AND a.deleted=0) RETURNING name`).bind(config, deviceId, identity,priority,name,Date.now(),name,identity,name).first();
     if (!saved) throw new AppError("账号有待执行任务，请完成后再编辑", 409);
   }
   await saveLog(env, name, "账号管理", create ? "账号已创建" : "账号已更新", "设备绑定已固定，敏感配置已加密");
-  return publicAccount({ ...old,name, device_id: deviceId,paused:old?.paused ?? 0 } as AccountRow, account);
+  return publicAccount({ ...old,name, device_id: deviceId,priority,paused:old?.paused ?? 0 } as AccountRow, account);
 }
 export async function deleteAccount(env: Env, name: string): Promise<void> {
   const granted=await env.DB.prepare("SELECT grant_code_id FROM accounts WHERE name=? AND deleted=0").bind(name).first<{grant_code_id:string|null}>();

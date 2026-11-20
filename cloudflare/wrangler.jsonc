@@ -13,7 +13,7 @@
   "queues": {
     "producers": [{ "binding": "JOBS", "queue": "jrxy-auto-cf-jobs" }],
     "consumers": [{ "queue": "jrxy-auto-cf-jobs", "max_batch_size": 1,
-      "max_batch_timeout": 1, "max_concurrency": 1, "max_retries": 3, "retry_delay": 60 }]
+      "max_batch_timeout": 1, "max_concurrency": 3, "max_retries": 3, "retry_delay": 60 }]
   },
   "triggers": { "crons": ["* * * * *"] },
   "vars": {

@@ -139,7 +139,7 @@ describe("one-time redemption enrollment",()=>{
   it("rejects expired codes and requires a private status receipt and same-origin HTTPS",async()=>{
     const batch=await createCodeBatch(e,{...preset,redeemBefore:Date.now()+60_000}) as any;
     await e.DB.prepare("UPDATE redemption_batches SET redeem_before=? WHERE id=?").bind(Date.now()-1,batch.id).run();
-    await expect(start(batch.codes[0])).rejects.toThrow("最晚兑换时间");
+    await expect(start(batch.codes[0])).rejects.toThrow("最晚使用时间");
     await expect(enrollmentStatus(e,receipt())).rejects.toMatchObject({code:404});
     const path="/api/public/redemption/check";
     await expect(publicRedemption(new Request("https://manager.example"+path,{method:"POST",headers:{Origin:"https://other.example","Content-Type":"application/json"},body:JSON.stringify({code:batch.codes[0]})}),e,path)).rejects.toMatchObject({code:403});

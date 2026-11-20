@@ -14,6 +14,9 @@ export function safeDiagnostic(value: unknown, privateValues: string[] = []): Re
   if (["GET","POST","HEAD"].includes(String(input.method))) result.method=input.method as RequestDiagnostic["method"];
   if (["send","headers","body","decode","json"].includes(String(input.phase))) result.phase=input.phase as RequestDiagnostic["phase"];
   if (Number.isInteger(input.httpStatus) && Number(input.httpStatus)>=100 && Number(input.httpStatus)<=599) result.httpStatus=Number(input.httpStatus);
-  if (Number.isFinite(input.elapsedMs) && Number(input.elapsedMs)>=0) result.elapsedMs=Math.min(600000,Math.round(Number(input.elapsedMs)));
+  for(const key of ["elapsedMs","sessionElapsedMs","idleMs","timeoutMs"] as const)
+    if(Number.isFinite(input[key])&&Number(input[key])>=0)result[key]=Math.min(600000,Math.round(Number(input[key])));
+  for(const [key,max] of [["requestIndex",41],["redirectCount",10],["receivedBytes",2097152]] as const)
+    if(Number.isSafeInteger(input[key])&&Number(input[key])>=0)result[key]=Math.min(max,Number(input[key]));
   return result;
 }

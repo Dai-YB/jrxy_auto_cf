@@ -16,4 +16,6 @@ assert.ok(!pkg.scripts.build.includes("--remote"),"构建检查不得连接生�
 assert.ok(pkg.scripts.build.includes("--dry-run"));
 assert.ok(!config.vars?.ADMIN_PASSWORD&&!config.vars?.ENCRYPTION_KEY,"真实Secret不得写入仓库配置");
 assert.ok(!config.containers&&!config.r2_buckets,"本项目不需要付费容器或照片存储");
+assert.equal(config.queues.consumers[0].max_batch_size,1,"每次消费者只处理一个账号");
+assert.equal(config.queues.consumers[0].max_concurrency,3,"平台并发硬上限3，业务上限由持久化执行位控制");
 console.log("Deployment contract passed: one production pipeline, migrations before deploy, dry-run build and runtime secrets kept separate.");

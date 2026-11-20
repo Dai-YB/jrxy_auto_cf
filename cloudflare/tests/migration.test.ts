@@ -2,22 +2,41 @@ import { describe,it,expect } from "vitest";
 import { env } from "cloudflare:workers";
 import { reset,applyD1Migrations } from "cloudflare:test";
 import { seal } from "../src/security";
-import {createCodeBatch,publicRedemption,listEnrollments} from "../src/redemption";
-import {randomBytes} from "node:crypto";
+import {listEnrollments} from "../src/redemption";
 import { getAccount } from "../src/storage";
 import type { Env } from "../src/types";
 const e=env as unknown as Env & {TEST_MIGRATIONS:any[]};
 describe("non-destructive administrator upgrade",()=>{
   it("adds diagnostics without rewriting existing enrollment data",async()=>{
     await reset();await applyD1Migrations(e.DB,e.TEST_MIGRATIONS.slice(0,5));
-    const testEnv={...e,JOBS:{send:async()=>{}} as any};
-    const batch=await createCodeBatch(testEnv,{quantity:1,schoolName:"模拟学校",type:2,lon:120,lat:30,address:"合成位置",durationValue:1,durationUnit:"days"}) as any;
-    const path="/api/public/redemption/start";
-    await publicRedemption(new Request("https://manager.example"+path,{method:"POST",headers:{Origin:"https://manager.example","Content-Type":"application/json"},body:JSON.stringify({code:batch.codes[0],displayName:"模拟姓名",username:"student",password:"synthetic",receipt:randomBytes(32).toString("base64url"),consent:true})}),testEnv,path);
+    await e.DB.batch([
+      e.DB.prepare("INSERT INTO redemption_batches(id,note,school_name,task_type,longitude,latitude,address,duration_seconds,created_at) VALUES('batch','','模拟学校',2,120,30,'合成位置',86400,?)").bind(Date.now()),
+      e.DB.prepare("INSERT INTO redemption_codes(id,batch_id,code_hash,suffix,status,attempt_id) VALUES('code','batch','synthetic-hash','123456','reserved','attempt')"),
+      e.DB.prepare("INSERT INTO enrollment_attempts(id,code_id,receipt_hash,request_hash,credentials,created_at,expires_at) VALUES('attempt','code','receipt','request',?,?,?)")
+        .bind(await seal({username:"student",password:"synthetic"},e.ENCRYPTION_KEY,"enrollment:attempt"),Date.now(),Date.now()+600000)
+    ]);
     const before=await e.DB.prepare("SELECT * FROM enrollment_attempts").first<any>();
     await applyD1Migrations(e.DB,e.TEST_MIGRATIONS);
     const after=await e.DB.prepare("SELECT * FROM enrollment_attempts").first<any>();expect(after).toEqual({...before,diagnostic:null});
     expect((await listEnrollments(e) as any[])[0].diagnostic).toBeNull();
+  });
+  it("preserves old code digests, durations and in-flight serial jobs while adding defaults",async()=>{
+    await reset();await applyD1Migrations(e.DB,e.TEST_MIGRATIONS.slice(0,6));
+    await e.DB.batch([
+      e.DB.prepare("INSERT INTO redemption_batches(id,note,school_name,task_type,longitude,latitude,address,duration_seconds,created_at) VALUES('b','','模拟学校',2,120,30,'位置',604800,1)"),
+      e.DB.prepare("INSERT INTO redemption_codes(id,batch_id,code_hash,suffix,status) VALUES('c','b','original-hash','123456','used')"),
+      e.DB.prepare("INSERT INTO accounts(name,config,device_id,created_at) VALUES('a','','old-device',1)"),
+      e.DB.prepare("INSERT INTO batches(id,trigger,mode,label,created_at,round_due) VALUES('job-b','manual','dry','批量',1,1)"),
+      e.DB.prepare("INSERT INTO jobs(id,account,mode,trigger,status,next_at,created_at,batch_id,sequence_no) VALUES('j','a','dry','manual','pending',1,1,'job-b',4)"),
+      e.DB.prepare("UPDATE execution_gate SET owner='old-owner',lease_until=12345 WHERE id=1")
+    ]);
+    await applyD1Migrations(e.DB,e.TEST_MIGRATIONS);
+    expect(await e.DB.prepare("SELECT code_hash,code_cipher,status FROM redemption_codes").first()).toEqual({code_hash:"original-hash",code_cipher:null,status:"used"});
+    expect((await e.DB.prepare("SELECT duration_seconds FROM redemption_batches").first<any>()).duration_seconds).toBe(604800);
+    expect(await e.DB.prepare("SELECT priority,wave_no,sequence_no FROM jobs").first()).toEqual({priority:0,wave_no:4,sequence_no:4});
+    expect((await e.DB.prepare("SELECT concurrency_limit FROM batches").first<any>()).concurrency_limit).toBe(1);
+    expect((await e.DB.prepare("SELECT parallelism FROM execution_settings").first<any>()).parallelism).toBe(1);
+    expect(await e.DB.prepare("SELECT owner,lease_until FROM execution_gate").first()).toEqual({owner:"old-owner",lease_until:12345});
   });
   it("preserves old encrypted accounts, device IDs, plans and logs",async()=>{
     await reset();await applyD1Migrations(e.DB,e.TEST_MIGRATIONS.slice(0,3));

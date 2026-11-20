@@ -22,6 +22,11 @@ const compiled=await build({absWorkingDir:root,bundle:true,write:false,format:"e
         try{return Response.json({ok:true,data:await session.json("https://synthetic.example/probe")});}
         catch(error){return Response.json({ok:false,message:error.message,diagnostic:error.diagnostic});}
       }
+      if(input.action==="readBudget"){
+        const session=new Session(fetch,input.idleMs,input.totalMs);
+        try{return Response.json({ok:true,text:(await session.at("login_form").request("https://synthetic.example/"+input.scenario)).text});}
+        catch(error){return Response.json({ok:false,diagnostic:error.diagnostic});}
+      }
       if(input.action==="login"){
         try{const result=await login(input.user);return Response.json({status:"success",host:result.host});}
         catch(error){return Response.json({status:"error",message:error.message,diagnostic:error.diagnostic});}
@@ -32,12 +37,34 @@ const compiled=await build({absWorkingDir:root,bundle:true,write:false,format:"e
 let active=null,index=0;
 const wireErrors=[];
 let requests=0,checks=0;
+const encoder=new TextEncoder();
+function pacedBody(parts,interval){
+  let timer;
+  return new Response(new ReadableStream({
+    start(controller){
+      let i=0;
+      function send(){
+        controller.enqueue(encoder.encode(parts[i++]));
+        if(i===parts.length)controller.close();else timer=setTimeout(send,interval);
+      }
+      send();
+    },
+    cancel(){if(timer!==undefined)clearTimeout(timer);}
+  }),{headers:{"Set-Cookie":"probe=synthetic; Path=/; Secure"}});
+}
 // 保留workerd原生globalThis.fetch；只替换网络出口，所有目标都由内存服务响应。
 const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:compiled.outputFiles[0].text,
   compatibilityDate:config.compatibility_date,compatibilityFlags:config.compatibility_flags,
   outboundService:async request=>{
     requests++;
-    if(active===null){assert.equal(request.url,"https://synthetic.example/probe");return Response.json({synthetic:true});}
+    if(active===null){
+      const url=new URL(request.url);
+      assert.equal(url.origin,"https://synthetic.example");assert.equal(request.headers.get("Cookie"),null);
+      if(url.pathname==="/probe")return Response.json({synthetic:true});
+      if(url.pathname==="/paced")return pacedBody(Array(9).fill("x"),90);
+      if(url.pathname==="/stalled")return pacedBody(["x","late"],2200);
+      assert.equal(url.pathname,"/after-timeout");return new Response("fresh");
+    }
     const expected=active.calls[index++];
     if(!expected){wireErrors.push("unexpected request after original trace");return new Response("unexpected",{status:500});}
     try{
@@ -71,6 +98,15 @@ try{
     assert.equal(result.ok,true,"Native Session fetch failed: "+JSON.stringify(result));
     assert.equal(requests,before+1,"Native fetch must reach the local outbound service");checks++;
   }
+  const beforeSlow=requests;
+  const paced=await run({action:"readBudget",scenario:"paced",idleMs:460,totalMs:4000});
+  assert.deepEqual(paced,{ok:true,text:"xxxxxxxxx"},"Continuous native response must survive beyond the idle window");checks++;
+  const stalled=await run({action:"readBudget",scenario:"stalled",idleMs:460,totalMs:4000});
+  assert.equal(stalled.ok,false);assert.equal(stalled.diagnostic?.kind,"timeout");assert.equal(stalled.diagnostic?.phase,"body");
+  assert.equal(stalled.diagnostic?.httpStatus,200);assert.equal(stalled.diagnostic?.receivedBytes,1);checks++;
+  const fresh=await run({action:"readBudget",scenario:"after-timeout",idleMs:460,totalMs:4000});
+  assert.deepEqual(fresh,{ok:true,text:"fresh"},"A timed-out body must not affect the next native session");checks++;
+  assert.equal(requests,beforeSlow+3,"Timeout handling must not resend the request");
   for(const scenario of traces.cases){
     active=scenario;index=0;wireErrors.length=0;
     const user={...scenario.user,displayName:"模拟姓名不是学号",notifyKey:""};

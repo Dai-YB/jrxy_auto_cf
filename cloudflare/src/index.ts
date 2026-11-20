@@ -1,14 +1,14 @@
 import { AppError, type Env, type Mode } from "./types";
 import { readJson } from "./security";
 import { authorize, signIn, signOut, rateLimit } from "./auth";
-import { deleteAccount, getAccount, listAccounts, publicAccount, saveAccount, saveLog, setPaused } from "./storage";
+import { deleteAccount, getAccount, listAccounts, publicAccount, saveAccount, saveLog, setPaused, setPriorities } from "./storage";
 import { notifyOption, sendNotify } from "./notify";
 import { dispatch, enqueue, jobView, processJob } from "./jobs";
 import { localTime, scheduleView, tick, updateSchedule } from "./scheduler";
 import { extractDeviceId } from "./engine/device";
 import { settings } from "./config";
-import { createCodeBatch, listCodeBatches, listEnrollments, revokeCode, publicRedemption, processEnrollment } from "./redemption";
-import { cleanupExpiredAccounts } from "./expiry";
+import { executionView, updateExecution } from "./execution";
+import { createCodeBatch, listCodeBatches, listEnrollments, copyCodes, revokeCodes, revokeCode, publicRedemption, processEnrollment, dispatchEnrollments } from "./redemption";
 
 const json = (data: unknown, status = 200): Response => Response.json(data, { status, headers: {
   "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"
@@ -22,7 +22,19 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if(path==="/api/auth/logout" && method==="POST")return signOut(request,env);
   const identity=await authorize(request,env);
   if(path==="/api/auth/session" && method==="GET")return json(identity);
-  if(path==="/api/redemption/batches" && method==="GET")return json(await listCodeBatches(env));
+  if(path==="/api/execution"&&method==="GET")return json(await executionView(env));
+  if(path==="/api/execution"&&method==="POST"){const result=await updateExecution(env,await readJson(request));ctx.waitUntil(dispatch(env));return json(result);}
+  if(path==="/api/accounts/priority/batch"&&method==="POST")return json(await setPriorities(env,await readJson(request)));
+  if(path==="/api/redemption/batches" && method==="GET")return json(await listCodeBatches(env,url.searchParams.get("cursor")));
+  const codeAction=/^\/api\/redemption\/(codes|batches)\/([A-Za-z0-9-]+)\/(copy|revoke)$/.exec(path);
+  if(codeAction&&method==="POST"&&(codeAction[3]==="copy"||codeAction[1]==="batches")){
+    await readJson(request);
+    if(codeAction[3]==="copy"){
+      await rateLimit(env,"authorization-copy",30,60_000);
+      return json(await copyCodes(env,codeAction[2],codeAction[1]==="batches"));
+    }
+    return json(await revokeCodes(env,codeAction[2],true));
+  }
   if(path==="/api/redemption/attempts" && method==="GET")return json({attempts:await listEnrollments(env)});
   if(path==="/api/redemption/batches" && method==="POST")return json(await createCodeBatch(env,await readJson(request)),201);
   const revoke=/^\/api\/redemption\/codes\/([A-Za-z0-9-]+)\/revoke$/.exec(path);
@@ -31,7 +43,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const count = await env.DB.prepare("SELECT count(*) AS n,coalesce(sum(paused),0) AS paused FROM accounts WHERE deleted=0 AND (authorization_until IS NULL OR authorization_until>?)").bind(Date.now()).first<{n: number;paused:number}>();
     const offset = settings(env).timezone;
     return json({ platform: "Cloudflare Workers", engine_ready:true, accounts_dir:"D1 accounts", timezone:`UTC${offset >= 0 ? "+" : ""}${offset}`,
-      account_count: count?.n ?? 0, paused_count:count?.paused ?? 0, scheduler: await scheduleView(env), server_time: localTime(Date.now(),offset) });
+      account_count: count?.n ?? 0, paused_count:count?.paused ?? 0, execution:await executionView(env), scheduler: await scheduleView(env), server_time: localTime(Date.now(),offset) });
   }
   if (path === "/api/device-id/extract" && method === "POST") {
     const body = await readJson(request);
@@ -121,9 +133,10 @@ export default {
       try {
         if (typeof message.body?.id !== "string" || message.body.id.length > 200) { message.ack(); continue; }
         if(message.body.kind==="enrollment")await processEnrollment(env,message.body.id);
-        else if(message.body.kind===undefined){await cleanupExpiredAccounts(env);await processJob(env, message.body.id);await dispatch(env);}
+        else if(message.body.kind===undefined)await processJob(env, message.body.id);
         else {message.ack();continue;}
         message.ack();
+        await dispatch(env);await dispatchEnrollments(env);
       } catch { message.retry({ delaySeconds: 60 }); }
     }
   }

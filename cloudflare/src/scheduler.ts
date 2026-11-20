@@ -62,9 +62,9 @@ export async function updateSchedule(env: Env, body: Record<string, unknown>): P
 }
 export async function tick(env: Env, now = Date.now()): Promise<void> {
   requireConfigured(env);
-  await cleanupExpiredAccounts(env,now);
-  await cleanupEnrollments(env,now);
-  await indexLegacyIdentities(env);
+  const purged=await cleanupExpiredAccounts(env,now);
+  const stale=await cleanupEnrollments(env,now);
+  await indexLegacyIdentities(env,1);
   const cfg = settings(env);
   const s = await getSchedule(env, now);
   const slot = dueSlot(s, now, cfg.catchupMs / 60_000, cfg.timezone);
@@ -73,23 +73,24 @@ export async function tick(env: Env, now = Date.now()): Promise<void> {
     const id = `schedule:${slot}`;
     const label = now - slot < 120_000 ? "定时" : "定时补签";
     await env.DB.batch([
-      env.DB.prepare(`INSERT OR IGNORE INTO batches(id,trigger,mode,label,created_at,round_due)
-        SELECT ?,'schedule','submit',?,?,? WHERE EXISTS
+      env.DB.prepare(`INSERT OR IGNORE INTO batches(id,trigger,mode,label,created_at,round_due,concurrency_limit)
+        SELECT ?,'schedule','submit',?,?,?,(SELECT parallelism FROM execution_settings WHERE id=1) WHERE EXISTS
         (SELECT 1 FROM schedule WHERE id=1 AND revision=? AND enabled=1 AND last_slot IS NOT ?)
         AND NOT EXISTS(SELECT 1 FROM batches WHERE trigger='schedule' AND finished_at IS NULL)`)
         .bind(id, label, now, now, s.revision, String(slot)),
-      env.DB.prepare(`INSERT OR IGNORE INTO jobs(id,account,mode,trigger,max_attempts,next_at,created_at,trigger_label,batch_id,sequence_no,account_version)
-        SELECT ? || ':' || name,name,'submit','schedule',?,?,?,?,?,ROW_NUMBER() OVER(ORDER BY name)-1,pause_version
+      env.DB.prepare(`INSERT OR IGNORE INTO jobs(id,account,mode,trigger,max_attempts,next_at,created_at,trigger_label,batch_id,sequence_no,account_version,priority,wave_no)
+        SELECT ? || ':' || name,name,'submit','schedule',?,?,?,?,?,ROW_NUMBER() OVER(ORDER BY priority DESC,name)-1,pause_version,priority,
+          CAST((ROW_NUMBER() OVER(PARTITION BY priority ORDER BY name)-1)/(SELECT concurrency_limit FROM batches WHERE id=?) AS INTEGER)
         FROM accounts WHERE deleted=0 AND paused=0 AND resume_after<? AND (authorization_until IS NULL OR authorization_until>?) AND EXISTS(SELECT 1 FROM batches WHERE id=? AND finished_at IS NULL)
         AND EXISTS(SELECT 1 FROM schedule WHERE id=1 AND revision=? AND enabled=1 AND last_slot IS NOT ?)`)
-        .bind(id, cfg.maxAttempts, now, now, label, id, slot,now, id, s.revision, String(slot)),
+        .bind(id, cfg.maxAttempts, now, now, label, id, id, slot,now, id, s.revision, String(slot)),
       env.DB.prepare(`UPDATE schedule SET last_slot=? WHERE id=1 AND revision=? AND enabled=1
         AND EXISTS(SELECT 1 FROM batches WHERE id=?)`).bind(String(slot), s.revision, id),
       env.DB.prepare(`UPDATE batches SET finished_at=?,summary='没有可用账号',detail='' WHERE id=?
         AND NOT EXISTS(SELECT 1 FROM jobs WHERE batch_id=?)`).bind(now, id, id)
     ]);
   }
-  await dispatch(env);
+  await dispatch(env,purged||stale?1:3);
   if (Math.floor(now / 60_000) % 1440 === 0) await env.DB.batch([
     env.DB.prepare("DELETE FROM account_locks WHERE lease_until<?").bind(now),
     env.DB.prepare("DELETE FROM admin_sessions WHERE expires_at<=?").bind(now),

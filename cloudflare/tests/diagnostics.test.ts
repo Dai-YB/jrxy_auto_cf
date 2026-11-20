@@ -25,6 +25,12 @@ describe("safe request diagnostics",()=>{
     expect(safeDiagnostic({...value,host:"private-student.example.edu"},["private-student"])).not.toHaveProperty("host");
     expect(safeDiagnostic({...value,host:value.url})).not.toHaveProperty("host");expect(safeDiagnostic({stage:"injected",kind:"transport"})).toBeNull();
   });
+  it("keeps bounded timing counters and ignores unexpected values",()=>{
+    const base={stage:"login_form",kind:"timeout",phase:"body"};
+    expect(safeDiagnostic({...base,timeoutMs:30000,idleMs:30001,sessionElapsedMs:999999,requestIndex:3,redirectCount:0,receivedBytes:2048,body:"secret"}))
+      .toEqual({...base,timeoutMs:30000,idleMs:30001,sessionElapsedMs:600000,requestIndex:3,redirectCount:0,receivedBytes:2048});
+    expect(safeDiagnostic({...base,timeoutMs:"30000",idleMs:-1,sessionElapsedMs:Infinity,requestIndex:1.5,redirectCount:null,receivedBytes:"secret"})).toEqual(base);
+  });
   it("supports both cookie APIs without splitting Expires commas or merging cookies",()=>{
     const values=["first=a; Expires=Wed, 01 Jan 2031 00:00:00 GMT; Path=/","second=b; Path=/"];
     expect(responseCookies({getSetCookie:()=>values} as any)).toEqual(values);
@@ -101,9 +107,64 @@ describe("safe request diagnostics",()=>{
     const path="/api/redemption/attempts",ctx=createExecutionContext();expect((await worker.fetch(new Request(origin+path),e,ctx)).status).toBe(401);
     const response=await worker.fetch(new Request(origin+path,{headers:await adminHeaders(e)}),e,ctx);expect(response.status).toBe(200);
     const statusPath="/api/public/redemption/status";const publicResponse=await publicRedemption(new Request(origin+statusPath,{method:"POST",headers:{Origin:origin,"Content-Type":"application/json"},body:JSON.stringify({receipt})}),e,statusPath);
-    const text=await publicResponse.text();expect(text).not.toContain("diagnostic");expect(text).not.toContain("login.example.edu");expect(text).toContain("未消耗兑换码");
+    const text=await publicResponse.text();expect(text).not.toContain("diagnostic");expect(text).not.toContain("login.example.edu");expect(text).toContain("未消耗授权码");
     await e.DB.prepare("UPDATE enrollment_attempts SET expires_at=?").bind(Date.now()-1).run();expect(await listEnrollments(e)).toEqual([]);await cleanupEnrollments(e);
     expect((await e.DB.prepare("SELECT count(*) AS n FROM enrollment_attempts").first<any>()).n).toBe(0);
+  });
+  it("isolates a stalled authorization between two successful logins at the same school",async()=>{
+    e={...e,JRXY_HTTP_TIMEOUT:"1",JRXY_RUN_TIMEOUT:"10"};
+    const schoolName="模拟学校",users=["student-alpha","student-beta","student-gamma"],path="/api/public/redemption/start";
+    const batch=await createCodeBatch(e,{quantity:3,schoolName,type:2,lon:120,lat:30,address:"合成位置"}) as {codes:string[]};
+    const posted:string[]=[],cookiesAtLoginPage:Array<string|null>=[];
+    const subrequestCookieChecks:string[]=[];
+    let discoveries=0,cancelled=0;
+    const transport=vi.spyOn(globalThis,"fetch").mockImplementation(async(input,init)=>{
+      const url=new URL(String(input)),cookie=new Headers(init?.headers).get("Cookie");
+      if(url.pathname.endsWith("/tenant/list")){discoveries++;return Response.json({data:[{id:"local",name:schoolName,joinType:"CLOUD"}]});}
+      if(url.pathname.endsWith("/tenant/info"))return Response.json({data:[{joinType:"CLOUD",ampUrl:"https://school.campusphere.net/portal"}]});
+      if(url.pathname==="/portal")return new Response(null,{status:302,headers:{Location:"https://login.example.edu/iap/login"}});
+      if(url.pathname==="/iap/login"){
+        cookiesAtLoginPage.push(cookie);
+        return new Response("login",{headers:{"Set-Cookie":`flow=isolated-${discoveries}; Path=/; Secure`}});
+      }
+      if(["/iap/security/lt","/iap/checkNeedCaptcha","/iap/doLogin"].includes(url.pathname))subrequestCookieChecks.push(cookie??"");
+      if(url.pathname==="/iap/security/lt")return Response.json({result:{_lt:"local-ticket"}});
+      if(url.pathname==="/iap/checkNeedCaptcha")return Response.json({needCaptcha:false});
+      if(url.pathname==="/iap/doLogin"){
+        const username=url.searchParams.get("username")??"";posted.push(username);
+        if(username===users[1])return new Response(new ReadableStream<Uint8Array>({
+          start(controller){controller.enqueue(new Uint8Array([123]));},cancel(){cancelled++;}
+        }));
+        return new Response(null,{status:302,headers:{Location:"https://school.campusphere.net/callback"}});
+      }
+      if(url.pathname==="/callback")return new Response("ok",{headers:{"Set-Cookie":"MOD_AUTH_CAS=local-auth; Path=/; Secure"}});
+      throw new Error("Unexpected synthetic request");
+    });
+    try{
+      const statuses:string[]=[];
+      for(const [i,username] of users.entries()){
+        const receipt=randomBytes(32).toString("base64url"),body={code:batch.codes[i],displayName:"合成姓名",username,password:"synthetic-password",receipt,consent:true};
+        const started=await publicRedemption(new Request(origin+path,{method:"POST",headers:{Origin:origin,"Content-Type":"application/json"},body:JSON.stringify(body)}),e,path);
+        expect(started.status).toBe(202);
+        const id=(e.JOBS.send as any).mock.calls[i][0].id;
+        await processEnrollment(e,id);
+        const statusPath="/api/public/redemption/status";
+        const response=await publicRedemption(new Request(origin+statusPath,{method:"POST",headers:{Origin:origin,"Content-Type":"application/json"},body:JSON.stringify({receipt})}),e,statusPath);
+        const result=await response.json() as {status:string;message:string};statuses.push(result.status);
+        expect(result).not.toHaveProperty("diagnostic");expect(JSON.stringify(result)).not.toContain(username);
+      }
+      expect(statuses).toEqual(["succeeded","failed","succeeded"]);expect(posted).toEqual(users);expect(cancelled).toBe(1);
+      expect(cookiesAtLoginPage).toEqual([null,null,null]);
+      expect(subrequestCookieChecks).toEqual([1,2,3].flatMap(i=>Array(3).fill(`flow=isolated-${i}`)));
+      const failure=await e.DB.prepare("SELECT credentials,account_config,device_id,error_code,diagnostic FROM enrollment_attempts WHERE status='failed'").first<{diagnostic:string}>();
+      expect(failure).toMatchObject({credentials:"",account_config:"",device_id:"",error_code:"timeout"});
+      expect(JSON.parse(failure!.diagnostic)).toMatchObject({stage:"login_submit",kind:"timeout",phase:"body",httpStatus:200,requestIndex:7,receivedBytes:1,timeoutMs:1000});
+      expect(failure!.diagnostic).not.toMatch(/student-|synthetic-password|local-ticket|doLogin/);
+      const codes=await e.DB.prepare("SELECT status FROM redemption_codes ORDER BY rowid").all<{status:string}>();
+      expect(codes.results.map(code=>code.status)).toEqual(["used","unused","used"]);
+      expect(await e.DB.prepare("SELECT count(*) AS n FROM accounts").first("n")).toBe(2);
+      expect(await e.DB.prepare("SELECT count(*) AS n FROM execution_slots WHERE owner IS NOT NULL OR task_id IS NOT NULL").first("n")).toBe(0);
+    }finally{transport.mockRestore();}
   });
   it.each([["timeout","timeout"],["total_timeout","timeout"],["http","upstream"],["body_read","response_read"],["response_processing","protocol"]] as const)("maps %s to a safe public category without retrying login",async(kind,code)=>{
     const {row}=await attempt(),run=vi.fn().mockRejectedValue(new EngineError("do not expose this error","error",true,{stage:"captcha_check",kind,httpStatus:kind==="http"?503:undefined}));

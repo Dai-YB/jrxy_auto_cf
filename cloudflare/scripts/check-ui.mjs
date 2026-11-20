@@ -12,7 +12,7 @@ function checkPage(html,js,name){
   new Script(js,{filename:"public/"+name});return ids;
 }
 const ids=checkPage(html,js,"app.js");
-for(const id of ["loginForm","loginUsername","loginPassword","logoutButton","accountRows","accountCards","accountForm","scheduleForm","logList","testNotify","codeBatchForm","codeOutput"])
+for(const id of ["loginForm","loginUsername","loginPassword","logoutButton","accountRows","accountCards","accountForm","scheduleForm","logList","testNotify","codeBatchForm","codeOutput","priorityForm","parallelism","codePrevious","codeNext"])
   assert.ok(ids.includes(id),"缺少后台功能："+id);
 assert.ok(!headers.includes("script-src 'self' 'unsafe-inline'"),"脚本CSP不得允许unsafe-inline");
 assert.ok(css.includes("@media(max-width:600px)"),"需要手机响应式布局");
@@ -24,10 +24,15 @@ assert.ok(!/\brequired\b/.test(html.match(/<input id="accountDevice"[^>]*>/)[0])
 assert.ok(ids.includes("enrollmentList")&&ids.includes("refreshEnrollments"),"后台需要脱敏验证诊断");
 const userHtml=read("index.html"),userJs=read("enroll.js");
 const userIds=checkPage(userHtml,userJs,"enroll.js");
-for(const id of ["codeForm","redeemCode","enrollForm","enrollmentName","schoolUsername","schoolPassword","enrollProgress","enrollSuccess"])
+for(const id of ["codeForm","redeemCode","enrollForm","enrollmentName","schoolUsername","schoolPassword","enrollProgress","enrollSuccess","notifyEnabled","sendKey","notifyGuide","successNotify"])
   assert.ok(userIds.includes(id),"缺少用户开通控件："+id);
 assert.match(userHtml,/<input id="enrollmentName"[^>]*maxlength="50"[^>]*required/);
 assert.ok(!userIds.includes("loginForm")&&!userIds.includes("accountRows"),"默认页不得展示管理员数据");
 assert.ok(!/storage\.setItem/i.test(userJs),"用户凭据与兑换码不持久化到浏览器");
 assert.ok(!/name="(?:lon|lat|schoolName|deviceId|notifyRcv)"/.test(userHtml),"用户不能输入后台预设字段");
-console.log("UI contract passed: separate user/admin pages, safe scripts, one-time-code controls, mobile layouts and account management.");
+assert.ok(!/\bchecked\b/.test(userHtml.match(/<input id="notifyEnabled"[^>]*>/)[0]),"通知默认关闭");
+assert.match(userHtml,/<input id="sendKey"[^>]*type="password"/);
+assert.match(userHtml,/href="https:\/\/sct\.ftqq\.com\/login"[^>]*target="_blank"[^>]*rel="noopener noreferrer"/);
+assert.match(html,/<input id="codeDuration"[^>]*value="24"/);
+assert.ok(!userHtml.includes("兑换码")&&!html.includes("兑换码"),"用户可见码名称统一为授权码");
+console.log("UI contract passed: separate user/admin pages, safe scripts, authorization code pagination, opt-in notification guide, priorities and execution settings.");

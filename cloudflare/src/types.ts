@@ -44,6 +44,7 @@ export interface AccountRow {
   paused: number;
   pause_version: number;
   resume_after: number;
+  priority: number;
   identity_key: string | null;
   grant_code_id: string | null;
   authorization_from: number | null;
@@ -65,6 +66,8 @@ export interface Job {
   trigger_label: string;
   batch_id: string | null;
   sequence_no: number;
+  priority: number;
+  wave_no: number;
   status: "pending" | "running" | "done";
   attempts: number;
   max_attempts: number;
@@ -96,6 +99,7 @@ export interface Batch {
   summary: string | null;
   detail: string | null;
   privacy_version: number;
+  concurrency_limit: number;
 }
 export interface Schedule {
   id: number;
@@ -121,6 +125,12 @@ export interface RequestDiagnostic {
   method?: "GET" | "POST" | "HEAD";
   httpStatus?: number;
   elapsedMs?: number;
+  sessionElapsedMs?: number;
+  idleMs?: number;
+  timeoutMs?: number;
+  requestIndex?: number;
+  redirectCount?: number;
+  receivedBytes?: number;
 }
 export class EngineError extends Error {
   constructor(message: string, public status: Result["status"] = "fail", public retryable = false, public diagnostic?: RequestDiagnostic) { super(message); }
