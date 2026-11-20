@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "jrxy-auto-cf",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": ["/api/*"] },
+  "d1_databases": [{
+    "binding": "DB", "database_name": "jrxy-auto-cf",
+    "database_id": "00000000-0000-0000-0000-000000000000",
+    "migrations_dir": "migrations"
+  }],
+  "queues": {
+    "producers": [{ "binding": "JOBS", "queue": "jrxy-auto-cf-jobs" }],
+    "consumers": [{ "queue": "jrxy-auto-cf-jobs", "max_batch_size": 1,
+      "max_batch_timeout": 1, "max_concurrency": 1, "max_retries": 3, "retry_delay": 60 }]
+  },
+  "triggers": { "crons": ["* * * * *"] },
+  "vars": {
+    "AUTO_SIGN": "0", "SIGN_TIME": "22:05", "TZ_OFFSET": "8",
+    "CATCHUP_MINUTES": "120", "MAX_RETRIES": "2", "RETRY_DELAY_MINUTES": "5",
+    "JRXY_INTERVAL": "10", "JRXY_HTTP_TIMEOUT": "30", "JRXY_RUN_TIMEOUT": "300",
+    "NOTIFY_ON_DRY": "0"
+  },
+  "observability": { "enabled": true, "head_sampling_rate": 0.1 }
+}

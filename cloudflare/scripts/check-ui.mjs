@@ -1,0 +1,22 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { Script } from "node:vm";
+const html=readFileSync(new URL("../public/index.html",import.meta.url),"utf8");
+const js=readFileSync(new URL("../public/app.js",import.meta.url),"utf8");
+const css=readFileSync(new URL("../public/style.css",import.meta.url),"utf8");
+const headers=readFileSync(new URL("../public/_headers",import.meta.url),"utf8");
+const ids=[...html.matchAll(/\bid="([^"]+)"/g)].map(match=>match[1]);
+assert.equal(ids.length,new Set(ids).size,"页面ID不能重复");
+for(const id of ["loginForm","loginUsername","loginPassword","logoutButton","accountRows","accountCards","accountForm","scheduleForm","logList","testNotify"])
+  assert.ok(ids.includes(id),"缺少界面功能："+id);
+for(const match of js.matchAll(/\$\("([^"]+)"\)/g))assert.ok(ids.includes(match[1]),"脚本引用不存在的控件："+match[1]);
+assert.ok(!/\bon(?:click|submit|change|input)\s*=/.test(html),"不允许内联事件处理器");
+assert.ok(!/<script\b[^>]*>[\s\S]*?\S[\s\S]*?<\/script>/.test(html.replace(/<script\b[^>]*src=[^>]*><\/script>/g,"")),"脚本需使用外部文件");
+assert.ok(!/localStorage\.setItem|X-Web-Token|innerHTML\s*=/.test(js),"不能使用旧令牌鉴权或注入未转义HTML");
+assert.ok(!headers.includes("script-src 'self' 'unsafe-inline'"),"脚本CSP不得允许unsafe-inline");
+assert.ok(css.includes("@media(max-width:600px)"),"需要手机响应式布局");
+assert.ok(html.includes('autocomplete="current-password"')&&html.includes('autocomplete="username"'),"登录支持密码管理器");
+const select=html.match(/<select id="accountType"[\s\S]*?<\/select>/)[0];
+assert.deepEqual([...select.matchAll(/value="(\d+)"/g)].map(m=>m[1]).sort(),["1","2"],"仅支持签到与查寝");
+new Script(js,{filename:"public/app.js"});
+console.log("UI contract passed: login, mobile cards, pause-compatible controls, notifications, schedule, safe rendering and script syntax.");

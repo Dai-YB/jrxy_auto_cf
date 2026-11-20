@@ -1,0 +1,7 @@
+# 复制到 .dev.vars，填写你自己的管理员账号和至少12字符的强密码。
+# 管理员账号与学校学号分开；不要提交 .dev.vars。
+ADMIN_USERNAME="your-admin-name"
+ADMIN_PASSWORD="replace-with-a-unique-strong-password"
+# 旧版升级务必沿用原 ENCRYPTION_KEY，不要重新生成！
+# 新安装使用32随机字节的标准Base64。
+ENCRYPTION_KEY="replace-with-base64-of-32-random-bytes"

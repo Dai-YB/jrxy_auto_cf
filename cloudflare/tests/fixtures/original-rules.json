@@ -1,0 +1,387 @@
+{
+  "form": {
+    "user": {
+      "type": 2,
+      "lon": 116.123,
+      "lat": 39.456,
+      "address": "测试位置",
+      "abnormalReason": "",
+      "checkTitle": 1,
+      "forms": [
+        {
+          "form": {
+            "title": "健康状态",
+            "value": "正常"
+          }
+        },
+        {
+          "form": {
+            "title": "备注",
+            "value": "其他",
+            "extra": "测试'O\n中文"
+          }
+        }
+      ]
+    },
+    "task": {
+      "isPhoto": 0,
+      "isNeedExtra": 1,
+      "isMalposition": 0,
+      "signInstanceWid": "instance-1",
+      "extraField": [
+        {
+          "title": "健康状态",
+          "extraFieldItems": [
+            {
+              "content": "正常",
+              "isOtherItems": 0,
+              "isSelected": true,
+              "wid": "item-1"
+            }
+          ]
+        },
+        {
+          "title": "备注",
+          "extraFieldItems": [
+            {
+              "content": "其他",
+              "isOtherItems": 1,
+              "isSelected": false,
+              "wid": "item-2"
+            }
+          ]
+        }
+      ]
+    },
+    "expected": {
+      "signPhotoUrl": "",
+      "isNeedExtra": 1,
+      "extraFieldItems": [
+        {
+          "extraFieldItemValue": "正常",
+          "extraFieldItemWid": "item-1"
+        },
+        {
+          "extraFieldItemValue": "测试'O\n中文",
+          "extraFieldItemWid": "item-2"
+        }
+      ],
+      "signInstanceWid": "instance-1",
+      "longitude": 116.123,
+      "latitude": 39.456,
+      "isMalposition": 0,
+      "abnormalReason": "",
+      "position": "测试位置",
+      "uaIsCpadaily": true,
+      "signVersion": "1.0.0"
+    }
+  },
+  "pythonStrings": [
+    {
+      "input": true,
+      "expected": "True"
+    },
+    {
+      "input": false,
+      "expected": "False"
+    },
+    {
+      "input": null,
+      "expected": "None"
+    },
+    {
+      "input": [
+        {
+          "extraFieldItemValue": "正常",
+          "extraFieldItemWid": "item-1"
+        },
+        {
+          "extraFieldItemValue": "测试'O\n中文",
+          "extraFieldItemWid": "item-2"
+        }
+      ],
+      "expected": "[{'extraFieldItemValue': '正常', 'extraFieldItemWid': 'item-1'}, {'extraFieldItemValue': \"测试'O\\n中文\", 'extraFieldItemWid': 'item-2'}]"
+    }
+  ],
+  "selection": [
+    {
+      "user": {
+        "type": 2,
+        "lon": 116.123,
+        "lat": 39.456,
+        "address": "测试位置",
+        "abnormalReason": "",
+        "checkTitle": 1,
+        "forms": [
+          {
+            "form": {
+              "title": "健康状态",
+              "value": "正常"
+            }
+          },
+          {
+            "form": {
+              "title": "备注",
+              "value": "其他",
+              "extra": "测试'O\n中文"
+            }
+          }
+        ]
+      },
+      "list": {
+        "unSignedTasks": [
+          {
+            "taskName": "晚间查寝1",
+            "signInstanceWid": "a",
+            "signWid": "sa"
+          },
+          {
+            "taskName": "晚间查寝2",
+            "signInstanceWid": "b",
+            "signWid": "sb"
+          }
+        ],
+        "leaveTasks": [],
+        "signedTasks": []
+      },
+      "expected": {
+        "signInstanceWid": "a",
+        "signWid": "sa"
+      }
+    },
+    {
+      "user": {
+        "type": 2,
+        "lon": 116.123,
+        "lat": 39.456,
+        "address": "测试位置",
+        "abnormalReason": "",
+        "checkTitle": 1,
+        "forms": [
+          {
+            "form": {
+              "title": "健康状态",
+              "value": "正常"
+            }
+          },
+          {
+            "form": {
+              "title": "备注",
+              "value": "其他",
+              "extra": "测试'O\n中文"
+            }
+          }
+        ],
+        "formTitle": "晚间"
+      },
+      "list": {
+        "unSignedTasks": [
+          {
+            "taskName": "晚间查寝1",
+            "signInstanceWid": "a",
+            "signWid": "sa"
+          },
+          {
+            "taskName": "晚间查寝2",
+            "signInstanceWid": "b",
+            "signWid": "sb"
+          }
+        ],
+        "leaveTasks": [],
+        "signedTasks": []
+      },
+      "expected": {
+        "signInstanceWid": "b",
+        "signWid": "sb"
+      }
+    },
+    {
+      "user": {
+        "type": 2,
+        "lon": 116.123,
+        "lat": 39.456,
+        "address": "测试位置",
+        "abnormalReason": "",
+        "checkTitle": 1,
+        "forms": [
+          {
+            "form": {
+              "title": "健康状态",
+              "value": "正常"
+            }
+          },
+          {
+            "form": {
+              "title": "备注",
+              "value": "其他",
+              "extra": "测试'O\n中文"
+            }
+          }
+        ],
+        "formTitle": "不存在"
+      },
+      "list": {
+        "unSignedTasks": [
+          {
+            "taskName": "晚间查寝1",
+            "signInstanceWid": "a",
+            "signWid": "sa"
+          },
+          {
+            "taskName": "晚间查寝2",
+            "signInstanceWid": "b",
+            "signWid": "sb"
+          }
+        ],
+        "leaveTasks": [],
+        "signedTasks": []
+      },
+      "expected": {
+        "signInstanceWid": "a",
+        "signWid": "sa"
+      }
+    }
+  ],
+  "classification": [
+    {
+      "input": {
+        "status": "success",
+        "message": "SUCCESS"
+      },
+      "expected": "签到成功"
+    },
+    {
+      "input": {
+        "status": "dry",
+        "message": "有待签任务"
+      },
+      "expected": "探测通过"
+    },
+    {
+      "input": {
+        "status": "already",
+        "message": "今日已签到：晚间查寝"
+      },
+      "expected": "今日已签到：晚间查寝"
+    },
+    {
+      "input": {
+        "status": "fail",
+        "message": "不在签到范围"
+      },
+      "expected": "签到失败：不在签到范围"
+    },
+    {
+      "input": {
+        "status": "error",
+        "message": "连接失败"
+      },
+      "expected": "执行异常：连接失败"
+    },
+    {
+      "input": {
+        "status": "no_task",
+        "message": "没有未签到的任务"
+      },
+      "expected": "暂无待签任务"
+    }
+  ],
+  "signatureMaterial": [
+    {
+      "form": {
+        "signPhotoUrl": "",
+        "isNeedExtra": 1,
+        "extraFieldItems": [
+          {
+            "extraFieldItemValue": "正常",
+            "extraFieldItemWid": "item-1"
+          },
+          {
+            "extraFieldItemValue": "测试'O\n中文",
+            "extraFieldItemWid": "item-2"
+          }
+        ],
+        "signInstanceWid": "instance-1",
+        "longitude": 120.0,
+        "latitude": 30.0,
+        "isMalposition": 0,
+        "abnormalReason": "",
+        "position": "测试位置",
+        "uaIsCpadaily": true,
+        "signVersion": "1.0.0"
+      },
+      "serialized": "{\"signPhotoUrl\": \"\", \"isNeedExtra\": 1, \"extraFieldItems\": [{\"extraFieldItemValue\": \"正常\", \"extraFieldItemWid\": \"item-1\"}, {\"extraFieldItemValue\": \"测试'O\\n中文\", \"extraFieldItemWid\": \"item-2\"}], \"signInstanceWid\": \"instance-1\", \"longitude\": 120.0, \"latitude\": 30.0, \"isMalposition\": 0, \"abnormalReason\": \"\", \"position\": \"测试位置\", \"uaIsCpadaily\": true, \"signVersion\": \"1.0.0\"}",
+      "sortedValues": "011.0.0120.030.0True[{'extraFieldItemValue': '正常', 'extraFieldItemWid': 'item-1'}, {'extraFieldItemValue': \"测试'O\\n中文\", 'extraFieldItemWid': 'item-2'}]instance-1测试位置"
+    },
+    {
+      "form": {
+        "signPhotoUrl": "",
+        "isNeedExtra": 1,
+        "extraFieldItems": [
+          {
+            "extraFieldItemValue": "正常",
+            "extraFieldItemWid": "item-1"
+          },
+          {
+            "extraFieldItemValue": "测试'O\n中文",
+            "extraFieldItemWid": "item-2"
+          }
+        ],
+        "signInstanceWid": "instance-1",
+        "longitude": 1e-05,
+        "latitude": -0.0,
+        "isMalposition": 0,
+        "abnormalReason": "",
+        "position": "测试位置",
+        "uaIsCpadaily": true,
+        "signVersion": "1.0.0"
+      },
+      "serialized": "{\"signPhotoUrl\": \"\", \"isNeedExtra\": 1, \"extraFieldItems\": [{\"extraFieldItemValue\": \"正常\", \"extraFieldItemWid\": \"item-1\"}, {\"extraFieldItemValue\": \"测试'O\\n中文\", \"extraFieldItemWid\": \"item-2\"}], \"signInstanceWid\": \"instance-1\", \"longitude\": 1e-05, \"latitude\": -0.0, \"isMalposition\": 0, \"abnormalReason\": \"\", \"position\": \"测试位置\", \"uaIsCpadaily\": true, \"signVersion\": \"1.0.0\"}",
+      "sortedValues": "-0.0011.0.01e-05True[{'extraFieldItemValue': '正常', 'extraFieldItemWid': 'item-1'}, {'extraFieldItemValue': \"测试'O\\n中文\", 'extraFieldItemWid': 'item-2'}]instance-1测试位置"
+    },
+    {
+      "form": {
+        "signPhotoUrl": "",
+        "isNeedExtra": 1,
+        "extraFieldItems": [
+          {
+            "extraFieldItemValue": "正常",
+            "extraFieldItemWid": "item-1"
+          },
+          {
+            "extraFieldItemValue": "测试'O\n中文",
+            "extraFieldItemWid": "item-2"
+          }
+        ],
+        "signInstanceWid": "instance-1",
+        "longitude": 116.123,
+        "latitude": 39.456,
+        "isMalposition": 0,
+        "abnormalReason": "",
+        "position": "测试位置",
+        "uaIsCpadaily": true,
+        "signVersion": "1.0.0"
+      },
+      "serialized": "{\"signPhotoUrl\": \"\", \"isNeedExtra\": 1, \"extraFieldItems\": [{\"extraFieldItemValue\": \"正常\", \"extraFieldItemWid\": \"item-1\"}, {\"extraFieldItemValue\": \"测试'O\\n中文\", \"extraFieldItemWid\": \"item-2\"}], \"signInstanceWid\": \"instance-1\", \"longitude\": 116.123, \"latitude\": 39.456, \"isMalposition\": 0, \"abnormalReason\": \"\", \"position\": \"测试位置\", \"uaIsCpadaily\": true, \"signVersion\": \"1.0.0\"}",
+      "sortedValues": "011.0.0116.12339.456True[{'extraFieldItemValue': '正常', 'extraFieldItemWid': 'item-1'}, {'extraFieldItemValue': \"测试'O\\n中文\", 'extraFieldItemWid': 'item-2'}]instance-1测试位置"
+    }
+  ],
+  "apis": [
+    {
+      "type": 1,
+      "paths": [
+        "wec-counselor-sign-apps/stu/sign/getStuSignInfosInOneDay",
+        "wec-counselor-sign-apps/stu/sign/detailSignInstance",
+        "wec-counselor-sign-apps/stu/sign/submitSign"
+      ]
+    },
+    {
+      "type": 2,
+      "paths": [
+        "wec-counselor-attendance-apps/student/attendance/getStuAttendacesInOneDay",
+        "wec-counselor-attendance-apps/student/attendance/detailSignInstance",
+        "wec-counselor-attendance-apps/student/attendance/submitSign"
+      ]
+    }
+  ]
+}

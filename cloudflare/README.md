@@ -1,0 +1,204 @@
+# jrxy_auto_cf · Cloudflare 部署与升级
+
+**签到 / 查寝、每日定时、多账号暂停、通知与日志。** 采用 Workers + D1 + Queues，原生 HTML/CSS/JS 管理台，桌面与手机自适应。不需要自己的服务器、Docker、付费容器、R2 或 OCR。
+
+现有 GitHub → Cloudflare 自动构建流程继续使用：**GitHub 保存代码，Cloudflare 运行同一套网页和后端**；不是另做 GitHub Pages，也不需要新增 GitHub Actions。
+
+> 本地 workerd、模拟学校/通知和浏览器交互已验证；没有替用户部署公网、使用真实学校账号签到或发送真实推送。远程免费CPU/额度、学校网络和协议兼容性需部署后实际核实。
+
+## 1. 从旧版升级：先看这里
+
+1. **保留原 D1 数据库、队列名称、绑定和 ENCRYPTION_KEY**，不要重建数据库或生成新的数据加密密钥。`jrxy_auto_cf` 是项目名，新安装的Worker默认使用 `jrxy-auto-cf`。已有部署升级时，请把 `wrangler.jsonc` 的 `name`、数据库ID和队列名保持为你现有资源；不要仅因项目更名新建一个同时执行Cron的Worker。
+2. 在 Cloudflare Worker 的“设置 → 变量和机密”新增两个 Secret：
+   - `ADMIN_USERNAME`：独立管理员账号，例如你自己设置的管理用户名。
+   - `ADMIN_PASSWORD`：至少12字符的随机强密码，推荐20字符以上。
+3. 旧 `WEB_TOKEN` 不再参与鉴权，可以删除。它不能绕过新的账号密码登录。
+4. 项目 `cloudflare/` 的 `npm run deploy` 会先检查，再执行D1增量迁移，成功后部署Worker；新迁移只增加暂停/会话等字段和表，不删账号、deviceId、计划或日志。
+5. 更新后用管理员账号密码进入管理台，学校学号和密码仍在账号编辑中配置，两者不同。
+
+**密码及 ENCRYPTION_KEY 不上传 GitHub。管理员凭据变更会使旧管理会话失效，但不会更换校园账号密码或设备ID。**
+
+## 2. GitHub 连接 Cloudflare 自动部署（推荐，沿用现有方式）
+
+Cloudflare 控制台中连接现有 GitHub 仓库/生产分支，配置：
+
+| 配置 | 值 |
+|---|---|
+| 根目录 / Root directory | `cloudflare` |
+| Node.js | 22 或更高版本 |
+| 安装依赖 | `npm ci`（平台自动安装时使用锁文件） |
+| 构建命令 / Build command | `npm run check && npm test && npm run build` |
+| 生产部署命令 / Deploy command | `npm run deploy` |
+
+`npm run build` 只进行 Wrangler dry-run，不修改生产库；`npm run deploy` 才执行 `wrangler d1 migrations apply DB --remote` 后发布。
+
+### 两类机密不要混淆
+
+- **运行时 Secrets**：`ADMIN_USERNAME`、`ADMIN_PASSWORD`、`ENCRYPTION_KEY`，放在 Worker 运行时配置。不要放在静态网页、仓库或日志中。
+- **构建部署凭据**：Cloudflare Git 集成使用的 API Token / Account ID。如果迁移提示权限不足，部署令牌除Workers脚本权限外，还需目标账号D1编辑权限及该配置所需的Queues权限。按实际资源最小授权，不授予无关账号权限。
+- 构建环境变量不会自动成为运行时Secret，运行时Secret也不应为测试而复制进GitHub。
+
+只有生产分支使用以上生产部署命令。部署脚本会拒绝全零数据库ID；Workers Builds 提供的 `WORKERS_CI_BRANCH`（兼容 `CF_BUILD_BRANCH` / `CF_PAGES_BRANCH`），还会核对 `PRODUCTION_BRANCH`（默认 `main`）。若你的生产分支是 `master` 或其他名称，请在构建环境设置 `PRODUCTION_BRANCH`。**非生产分支建议只执行检查和dry-run，关闭自动非生产发布**；不要让预览部署复用生产D1、队列或Cron。需要在线预览时，必须另配测试Worker/D1/Queue且关闭定时。
+
+本地手动部署也执行同一个 `npm run deploy`，因此两种方式没有另一套签到或通知逻辑。
+
+## 3. 首次部署
+
+在 `cloudflare/` 中执行：
+
+```bash
+npm ci
+npx wrangler login
+npx wrangler d1 create jrxy-auto-cf
+npx wrangler queues create jrxy-auto-cf-jobs
+```
+
+将 D1 返回的真实 `database_id` 填入 `wrangler.jsonc`，替换全零占位值。Worker名、数据库名和队列名如需调整，请同步修改相关配置。
+
+设置运行时Secret（如果Worker尚不存在，可先发布一次；缺少Secret时API与任务安全拒绝运行）：
+
+```bash
+npx wrangler secret put ADMIN_USERNAME
+npx wrangler secret put ADMIN_PASSWORD
+npx wrangler secret put ENCRYPTION_KEY
+npm run deploy
+```
+
+新安装的 `ENCRYPTION_KEY` 使用32随机字节的标准Base64，可生成：
+
+```bash
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
+```
+
+此命令仅用于首次安装。**升级必须沿用原密钥并做好备份，丢失密钥会无法解密旧账号。** 测试中的全零密钥与示例密码禁止用于生产。
+
+首次默认关闭自动签到。部署完成后打开输出的 `https://...workers.dev` 地址，登录管理台。
+
+## 4. 管理台登录与安全
+
+- 一个独立管理员账号，无公开注册和弱密码默认值。
+- 生产会话Cookie：`__Host-` 前缀、HttpOnly、Secure、SameSite=Strict，12小时过期；D1只保存随机会话ID摘要。
+- 浏览器不保存管理密码或访问令牌到 localStorage；CSRF值只在页面内存中。
+- 写入API校验同源与CSRF。退出会使当前会话立即失效，凭据轮换会使所有旧会话失效。
+- 登录请求按IP及全局限频；测试推送每账号每分钟最多一次。
+- 管理员密码保存在受控Cloudflare Secret，D1不保存它；不要在任何日志中打印请求体。
+- 密码忘记时，通过有权限的Cloudflare控制台重新设置 `ADMIN_PASSWORD`，不提供不安全的邮箱找回入口。
+- 本机 HTTP 使用独立的开发Cookie；远程登录必须HTTPS。
+
+## 5. 账号暂停与恢复
+
+账号列表可暂停/恢复，状态持久化在D1，不因部署更新丢失：
+
+- 暂停期间，定时/批量/单账号手动**签到提交都禁止**。
+- 编辑、登录测试、只探测、范围查询和通知测试仍可用。
+- 排队但尚未提交的签到/重试会被取消，日志记为暂停跳过，不发多余“签到失败”通知。
+- 提交前再次核对暂停状态和版本；暂停后立即恢复也不会让旧队列消息重新执行。
+- 恢复不补跑暂停期间的时间点，只接收新手动任务和后续定时。
+- 已发出的请求无法撤回；如果操作发生在提交开始之后，页面提示可能已进入提交阶段，最终结果和通知照常记录。
+- 暂停不清除学校密码、设备ID、位置或推送配置。
+
+## 6. 签到、查寝与通知
+
+使用现有 `src/engine/` 主链路：CAS/IAP登录 → 查询任务 → 表单校验 → 动态密钥 → `ios + first_v4 + fkey_cat` 提交。
+
+- 类型只包含 `1 签到` 和 `2 查寝`，不做照片上传/收集/政工/教师日志。
+- 手机原绑定 `deviceId` 必填，校验格式但不能仅凭字符串证明真实来源；不随机生成替代值。
+- 学校密码编辑留空保持原值；密码永不回显。
+- 探测只登录、查询和构造请求，不提交签到。
+- 原 `forms/formTitle/checkTitle` 规则继续支持，可通过旧配置迁移/API维护；编辑普通字段不会删除它们。
+- 获取签到范围仍会应用到位置配置；请确保提交的位置与实际情况及学校规则一致。
+
+### 通知落实方式
+
+沿用原Web的Server酱/Webhook功能：
+
+- `SCT...`（Turbo）、`sctp...`（Server酱³）、完整HTTP(S) Webhook地址。
+- 原 `title/desp` 表单格式、状态标题、账号名、触发来源、开始/结束时间及脱敏详情。
+- 手动/批量/定时签到推送；探测默认不推送，`NOTIFY_ON_DRY=1` 开启。
+- 定时重试的中间异常不推送，最终结果才推送。
+- 账号编辑的“测试推送”使用**已保存配置**，明确发送测试消息，不登录学校、不签到；真实点击将对外发送消息。
+- HTTP/服务返回成功只代表“服务已受理”，不保证手机已收到；额度不足、地址错误等写入日志。
+- 发送过程中进程中断可能无法确认送达，记录未知，不冒充成功或无限重发。
+
+## 7. 每日定时与恢复
+
+| 变量 | 默认 | 用途 |
+|---|---:|---|
+| `AUTO_SIGN` | `0` | 首次初始化开关，之后页面/D1设置优先 |
+| `SIGN_TIME` | `22:05` | 首次每日时间 |
+| `TZ_OFFSET` | `8` | 业务时间/日志时区 |
+| `CATCHUP_MINUTES` | `120` | 延迟触发后的补执行窗口（暂停账号不补） |
+| `JRXY_INTERVAL` | `10` | 同批次账号完成后的间隔秒数 |
+| `JRXY_HTTP_TIMEOUT` | `30` | 单请求超时秒数 |
+| `JRXY_RUN_TIMEOUT` | `300` | 单账号网络总时限秒数 |
+| `RETRY_DELAY_MINUTES` | `5` | 整轮完成后再等候重试 |
+| `MAX_RETRIES` | `2` | 定时最大额外重试次数 |
+| `NOTIFY_ON_DRY` | `0` | 探测通知开关 |
+
+Cron每分钟检查，Queue按账号分发；默认一次一个账号，D1互斥和任务版本处理重复/乱序/恢复。退出管理台不会停止定时。
+
+修改或关闭全局计划不打断已经开始的批次；**暂停单账号**则会取消它尚未提交的旧任务。提交超时先复查，已签成功、明确未签可定时重试，未知状态停止提示人工核实。
+
+Cron/Queue不是硬实时，实际开始可能晚于设定时间，首次Cron配置传播可能需要数分钟。不要同时在旧服务器和新Worker对同一账号开启自动签到。
+
+## 8. 免费计划与外部边界
+
+配置不使用付费容器、R2、AI、OCR或额外计算服务器。仍要遵守账号共享额度：
+
+- Workers Free：每日100,000请求，HTTP/Cron CPU预算小（文档10ms，网络等待不计CPU）。
+- Queues Free：每日10,000操作；小消息通常写/读/删共3次，重试另计，保留24小时。
+- D1 Free：每日500万行读、10万行写；单库500MB、账号总存储5GB。
+- 每分钟Cron约每日1,440触发，空闲时不持续发队列消息。日志不自动删除，请按需清理。
+
+本地测试不等同远程CPU配额验证。首次上线检查 Workers Metrics 中 `exceededCpu`、Queue积压与D1用量，不能承诺任意学校/账号数都免费稳定。
+
+学校须公网HTTPS可达且证书有效。校园内网、原 `requests` 本地代理、关闭证书验证或特殊MFA不能在本版本中原样使用；HTTP代理配置为迁移保留，非空会明确拒绝而非静默直连。
+
+**不使用OCR**；登录临时要求验证码时停止并记录/按签到通知配置报告。原PythonCLI未作为Web入口的Android/App实验分支、APPRISE插件不是本版的新入口。
+
+## 9. 旧账号迁移
+
+保留原 `.device_id`。默认只检查、不联网、不导出密码：
+
+```bash
+python -I cloudflare/scripts/import-accounts.py --accounts /path/to/accounts
+```
+
+确认要上传至自己的部署后，设置环境变量 `JRXY_ADMIN_USERNAME` 和 `JRXY_ADMIN_PASSWORD`（不是学校账号），执行：
+
+```bash
+python -I cloudflare/scripts/import-accounts.py --accounts /path/to/accounts --url https://YOUR-DEPLOYMENT --apply
+```
+
+工具先管理员登录，通过会话/CSRF导入，结束后退出；不覆盖已有账号、不自动学校登录/签到/推送。不再使用 `JRXY_WEB_TOKEN`。
+
+原 `jrxy-engine/scripts/extract_deviceid.py` 或鉴权后的 `/api/device-id/extract` 仍可提取本人提供的原协议头，不新增手机扫描/自动获取能力。
+
+## 10. 开发与验证
+
+```bash
+# cloudflare/目录
+npm ci
+# 复制 .dev.vars.example 为 .dev.vars，填写测试管理员账号/密码和数据密钥
+npm run db:local
+npm run dev
+npm run check
+npm test
+npm run build  # 仅dry-run，不发布
+```
+
+- 原生HTML/CSS/JS，只有小型域名公共后缀库 `tldts` 为业务依赖，用于CAS Cookie隔离。
+- `scripts/sync-ui.py` 已退役，不会覆盖新界面；页面直接维护在 `public/`。
+- `check` 包含类型、页面功能/安全契约、统一部署契约；协议原Python对照测试仍保留。
+- 增量迁移测试验证旧数据/设备/定时/日志不丢；鉴权、暂停并发、通知、模拟端到端签到和恢复都有自动化测试。
+- 本次发布审查：91项workerd测试全部通过（含19项原Python规则/API对照）；类型、页面契约、部署契约检查通过；依赖审计0项已知漏洞；Worker产物266.55 KiB、gzip 78.10 KiB（不含独立静态资源）。
+- 浏览器已验证管理员登录/退出、账号创建、桌面暂停和手机恢复、按钮禁用及手机登录布局。合成账号已清理，定时保持关闭。
+- 本地只使用合成账号，未发布公网、真实签到或实际推送。测试通过不等于具体学校的真实链路已验证。
+
+原Python源码保留作参考/回退。许可证及协议来源沿用MPL-2.0，见根目录与 `jrxy-engine/LICENSE`。兼容详情见 [MIGRATION-PARITY.md](MIGRATION-PARITY.md)。
+
+参考：[Workers Git集成](https://developers.cloudflare.com/workers/ci-cd/builds/)、[Workers限制](https://developers.cloudflare.com/workers/platform/limits/)、[Queues定价](https://developers.cloudflare.com/queues/platform/pricing/)、[D1限制](https://developers.cloudflare.com/d1/platform/limits/)。
+
+## 学习使用说明
+
+**本项目仅供学习与研究使用。** 只可用于本人或明确授权的账号，遵守学校、平台条款及适用法律；不得用于未经授权的访问、代签到或虚假位置上报。

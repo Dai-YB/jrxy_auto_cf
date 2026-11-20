@@ -1,0 +1,17 @@
+import assert from "node:assert/strict";
+import { readFileSync, accessSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+const config=JSON.parse(readFileSync(new URL("../wrangler.jsonc",import.meta.url),"utf8"));
+const pkg=JSON.parse(readFileSync(new URL("../package.json",import.meta.url),"utf8"));
+assert.equal(pkg.scripts.deploy,"npm run check && node scripts/deploy.mjs");
+const deploy=readFileSync(new URL("./deploy.mjs",import.meta.url),"utf8");
+assert.ok(deploy.indexOf('["d1","migrations","apply","DB","--remote"]')<deploy.indexOf('["deploy"]'),"必须先迁移数据库再部署");
+assert.ok(deploy.includes('部署已停止')&&deploy.includes('PRODUCTION_BRANCH')&&deploy.includes('WORKERS_CI_BRANCH'),"发布前校验占位ID和生产分支");
+const require=createRequire(import.meta.url);
+accessSync(join(dirname(require.resolve('wrangler/package.json')),'bin','wrangler.js'));
+assert.ok(!pkg.scripts.build.includes("--remote"),"构建检查不得连接生产数据库");
+assert.ok(pkg.scripts.build.includes("--dry-run"));
+assert.ok(!config.vars?.ADMIN_PASSWORD&&!config.vars?.ENCRYPTION_KEY,"真实Secret不得写入仓库配置");
+assert.ok(!config.containers&&!config.r2_buckets,"本项目不需要付费容器或照片存储");
+console.log("Deployment contract passed: one production pipeline, migrations before deploy, dry-run build and runtime secrets kept separate.");
