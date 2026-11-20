@@ -48,6 +48,12 @@ describe("safe request diagnostics",()=>{
     expect(safeDiagnostic({stage:"portal",kind:"response_processing",phase:"headers",message:"private"})).toEqual({stage:"portal",kind:"response_processing",phase:"headers"});
     expect(safeDiagnostic({stage:"portal",kind:"transport",phase:"private"})).not.toHaveProperty("phase");
   });
+  it("classifies native invocation mistakes as internal failures without exposing exception text",async()=>{
+    const transport=vi.fn(async()=>{throw new TypeError("Illegal invocation: private-password private-student");});
+    const error=await new Session(transport as any).at("tenant_list").request("https://mobile.campushoy.com/list").catch(value=>value);
+    expect(error).toMatchObject({retryable:false,diagnostic:{kind:"internal",phase:"send",stage:"tenant_list"}});
+    expect(JSON.stringify(error)).not.toContain("private-password");expect(JSON.stringify(error)).not.toContain("private-student");expect(transport).toHaveBeenCalledTimes(1);
+  });
   it("distinguishes a transport failure from an HTTP response without copying the exception",async()=>{
     const transport=vi.fn(async()=>{throw new Error("TLS or DNS details with password=private-password");});
     const session=new Session(transport as any).at("login_submit");

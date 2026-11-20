@@ -103,7 +103,9 @@ export class Session {
         // bytes避免fetch给原本无Content-Type的IAP字符串正文自动加text/plain。
         const wireBody=typeof body==="string"&&!h.has("Content-Type")?new TextEncoder().encode(body):body;
         this.last.phase=phase;
-        const response = await this.transport(url.href, { method, body:wireBody, headers: h, redirect: "manual", signal: abort.signal });
+        // 原生fetch不能以Session为this调用，否则workerd会在发出请求前抛Illegal invocation。
+        const transport=this.transport;
+        const response = await transport(url.href, { method, body:wireBody, headers: h, redirect: "manual", signal: abort.signal });
         phase="headers";this.last.phase=phase;
         this.last.httpStatus=response.status;
         for (const value of responseCookies(response.headers)) this.jar.set(value, url);
@@ -127,6 +129,8 @@ export class Session {
         this.last.elapsedMs=Math.max(0,Date.now()-started);
         if (e instanceof EngineError) { e.diagnostic??=this.diagnostic("response");throw e; }
         if(abort.signal.aborted)throw this.failure("上游请求超时",left<=timeoutMs?"total_timeout":"timeout",true);
+        if(phase==="send"&&e instanceof TypeError&&e.message.startsWith("Illegal invocation"))
+          throw this.failure("Worker请求函数调用异常，尚未发出请求；请联系管理员检查部署版本","internal");
         if(phase==="send")throw this.failure("发送上游请求失败，尚未取得响应（DNS、TLS或连接原因待核实）","transport",true);
         if(phase==="body")throw this.failure("已取得响应，但读取正文失败","body_read",true);
         throw this.failure("已取得响应，但处理响应头或内容失败；请查看管理员诊断","response_processing");

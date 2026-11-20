@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 const config=JSON.parse(readFileSync(new URL("../wrangler.jsonc",import.meta.url),"utf8"));
 const pkg=JSON.parse(readFileSync(new URL("../package.json",import.meta.url),"utf8"));
 assert.equal(pkg.scripts.deploy,"npm run check && node scripts/deploy.mjs");
+assert.equal(pkg.scripts.test,"vitest run && npm run test:native","完整回归必须包含不替换原生fetch的运行时检查");
+assert.equal(pkg.scripts["test:native"],"node scripts/test-native-fetch.mjs");
 const deploy=readFileSync(new URL("./deploy.mjs",import.meta.url),"utf8");
 assert.ok(deploy.indexOf('["d1","migrations","apply","DB","--remote"]')<deploy.indexOf('["deploy"]'),"必须先迁移数据库再部署");
 assert.ok(deploy.includes('部署已停止')&&deploy.includes('PRODUCTION_BRANCH')&&deploy.includes('WORKERS_CI_BRANCH'),"发布前校验占位ID和生产分支");
