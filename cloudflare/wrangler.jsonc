@@ -19,7 +19,7 @@
   "vars": {
     "AUTO_SIGN": "0", "SIGN_TIME": "22:05", "TZ_OFFSET": "8",
     "CATCHUP_MINUTES": "120", "MAX_RETRIES": "5", "RETRY_DELAY_MINUTES": "5",
-    "JRXY_INTERVAL": "10", "JRXY_HTTP_TIMEOUT": "30", "JRXY_RUN_TIMEOUT": "300",
+    "JRXY_INTERVAL": "10", "JRXY_HTTP_TIMEOUT": "60", "JRXY_RUN_TIMEOUT": "300",
     "NOTIFY_ON_DRY": "0"
   },
   "observability": { "enabled": true, "head_sampling_rate": 0.1 }

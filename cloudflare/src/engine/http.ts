@@ -1,6 +1,7 @@
 import { EngineError, type RequestDiagnostic, type RequestStage } from "../types";
 import { getDomain } from "tldts";
 import { pythonJson } from "./encoding";
+import { DEFAULT_HTTP_TIMEOUT_SECONDS, DEFAULT_RUN_TIMEOUT_SECONDS } from "../config";
 
 export const LOGIN_UA = "Mozilla/5.0 (Linux; Android 8.0.0; MI 6 Build/OPR1.170623.027; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/92.0.4515.131 Mobile Safari/537.36 okhttp/3.12.4";
 export const IOS_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 cpdaily/9.9.22 wisedu/9.9.22";
@@ -84,7 +85,7 @@ export class Session {
   private startedAt: number;
   private stage: RequestStage = "request";
   private last?: Omit<RequestDiagnostic,"stage"|"kind">;
-  constructor(private transport: typeof fetch = fetch, private timeoutMs = 30_000, runTimeoutMs = 300_000) {
+  constructor(private transport: typeof fetch = fetch, private timeoutMs = DEFAULT_HTTP_TIMEOUT_SECONDS*1000, runTimeoutMs = DEFAULT_RUN_TIMEOUT_SECONDS*1000) {
     this.startedAt=Date.now();
     this.deadline = this.startedAt + runTimeoutMs;
   }

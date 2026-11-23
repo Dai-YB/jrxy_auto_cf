@@ -7,6 +7,9 @@ import {login} from "../src/engine/login";
 import {safeDiagnostic} from "../src/diagnostics";
 import {createCodeBatch,publicRedemption,processEnrollment,listEnrollments,cleanupEnrollments} from "../src/redemption";
 import {EngineError,type Account,type Env} from "../src/types";
+import {saveAccount} from "../src/storage";
+import {enqueue,processJob} from "../src/jobs";
+import {execute} from "../src/engine/sign";
 import worker from "../src/index";
 import {adminHeaders} from "./helpers";
 const bindings=env as unknown as Env & {TEST_MIGRATIONS:any[]};let e:Env;
@@ -24,6 +27,16 @@ describe("safe request diagnostics",()=>{
     expect(safeDiagnostic(value)).toEqual({stage:"login_submit",kind:"http",host:"login.example.edu",method:"POST",httpStatus:503,elapsedMs:2});
     expect(safeDiagnostic({...value,host:"private-student.example.edu"},["private-student"])).not.toHaveProperty("host");
     expect(safeDiagnostic({...value,host:value.url})).not.toHaveProperty("host");expect(safeDiagnostic({stage:"injected",kind:"transport"})).toBeNull();
+  });
+  it("does not redact fixed diagnostic enums when a private value matches part of callback",async()=>{
+    const account={schoolName:"模拟学校",username:"private-student",password:"private-password",displayName:"call",type:2,deviceId:"fixed-device",notifyMethod:0};
+    await saveAccount(e,"a",account,true);const [id]=await enqueue(e,["a"],"login");
+    const loginFn=vi.fn().mockRejectedValue(new EngineError("private-password private-student call","error",true,{stage:"login_callback",kind:"timeout",phase:"send",host:"login.example.edu",timeoutMs:60000}));
+    await processJob(e,id,(user,device,mode,options)=>execute(user,device,mode,{...options,loginFn}));
+    const stored=JSON.parse((await e.DB.prepare("SELECT result FROM jobs WHERE id=?").bind(id).first<string>("result"))!);
+    expect(stored.detail).toContain('"stage":"login_callback"');expect(stored.detail).not.toContain("login_[REDACTED]back");
+    expect(stored.message).not.toMatch(/private-password|private-student|call/);
+    const detail=await e.DB.prepare("SELECT detail FROM sign_log WHERE kind='手动登录测试[a]'").first<string>("detail");expect(detail).toContain('"stage":"login_callback"');expect(detail).not.toMatch(/private-password|private-student/);
   });
   it("keeps bounded timing counters and ignores unexpected values",()=>{
     const base={stage:"login_form",kind:"timeout",phase:"body"};

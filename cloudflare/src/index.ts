@@ -41,8 +41,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if(revoke && method==="POST"){await revokeCode(env,revoke[1]);return json({ok:true});}
   if (path === "/api/status" && method === "GET") {
     const count = await env.DB.prepare("SELECT count(*) AS n,coalesce(sum(paused),0) AS paused FROM accounts WHERE deleted=0 AND (authorization_until IS NULL OR authorization_until>?)").bind(Date.now()).first<{n: number;paused:number}>();
-    const offset = settings(env).timezone;
-    return json({ platform: "Cloudflare Workers", engine_ready:true, accounts_dir:"D1 accounts", timezone:`UTC${offset >= 0 ? "+" : ""}${offset}`,
+    const cfg=settings(env),offset=cfg.timezone;
+    return json({ network:{httpTimeoutSeconds:cfg.httpTimeoutMs/1000,runTimeoutSeconds:cfg.runTimeoutMs/1000,submitTimeoutSeconds:20},platform: "Cloudflare Workers", engine_ready:true, accounts_dir:"D1 accounts", timezone:`UTC${offset >= 0 ? "+" : ""}${offset}`,
       account_count: count?.n ?? 0, paused_count:count?.paused ?? 0, execution:await executionView(env), scheduler: await scheduleView(env), server_time: localTime(Date.now(),offset) });
   }
   if (path === "/api/device-id/extract" && method === "POST") {

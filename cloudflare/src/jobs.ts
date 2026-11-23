@@ -2,6 +2,7 @@ import { execute, type Checkpoint } from "./engine/sign";
 import { getAccount } from "./storage";
 import { classify, notification, notifyHead, notifyOption, sendNotify } from "./notify";
 import { redact, requireConfigured, seal } from "./security";
+import { safeDiagnostic } from "./diagnostics";
 import { localTime, settings } from "./config";
 import { accountValid } from "./identity";
 import { purgeGrantedAccount } from "./expiry";
@@ -328,6 +329,8 @@ export async function processJob(env: Env, id: string, run = execute, deliveryTo
         const secretValues = [account.password, notifyOption(account).rcvOption, account.username, account.displayName??""];
         result.message = redact(result.message, secretValues);
         if (result.detail) result.detail = redact(result.detail, secretValues);
+        result.diagnostic=safeDiagnostic(result.diagnostic,secretValues)??undefined;
+        if(result.diagnostic)result.detail=[result.detail||result.message,`上游诊断：${JSON.stringify(result.diagnostic)}`].join("\n");
       } catch (e) {
         result = { status: "fail", message: e instanceof AppError ? e.message : "任务无法读取配置或执行，请检查账号与服务设置" };
       }

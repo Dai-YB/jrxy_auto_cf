@@ -89,6 +89,10 @@ $("confirmAccept").addEventListener("click",()=>resolveConfirm(true));
 $("confirmCancel").addEventListener("click",()=>resolveConfirm(false));
 $("confirmDialog").addEventListener("cancel",event=>{event.preventDefault();resolveConfirm(false);});
 
+function networkBudgetText(network) {
+  if(!network)return "暂未取得实际网络参数，请刷新管理台确认部署版本。";
+  return `实际网络等待：普通请求${network.httpTimeoutSeconds}秒（首次响应/正文无进展），单账号总时限${network.runTimeoutSeconds}秒；密钥协商与签到提交${network.submitTimeoutSeconds}秒。新执行读取此参数，不改变已开始请求。`;
+}
 async function loadStatus(updateForm=false) {
   const status=await api("/api/status");if(!signedIn)return;
   $("accountCount").textContent=status.account_count;$("pausedCount").textContent=status.paused_count;
@@ -105,6 +109,7 @@ async function loadStatus(updateForm=false) {
   if(updateForm||!scheduleDirty){$("scheduleEnabled").checked=status.scheduler.enabled;$("scheduleInput").value=status.scheduler.time;}
   if(updateForm||!executionDirty)$("parallelism").value=String(status.execution.parallelism);
   $("executionState").textContent=`运行 ${status.execution.active} / ${status.execution.parallelism} · 等待 ${status.execution.waiting}`;
+  $("networkBudget").textContent=networkBudgetText(status.network);
   $("connectionState").replaceChildren(element("i"),document.createTextNode("已连接"));
 }
 async function loadAccounts() {

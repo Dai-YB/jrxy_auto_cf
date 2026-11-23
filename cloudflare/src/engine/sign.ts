@@ -203,6 +203,6 @@ export async function execute(account: Account, deviceId: string, mode: Mode, op
   const trace: string[] = [];
   const result = await runExecution(account,deviceId,mode,options,trace);
   const diagnostic=safeDiagnostic(result.diagnostic,[account.password,account.username,account.displayName??"",account.notifyOption?.rcvOption??account.notifyKey]);
-  if(diagnostic)trace.push(`上游诊断：${JSON.stringify(diagnostic)}`);
+  // 诊断保持结构化；报告层脱敏业务文本后再格式化，避免固定枚举被误替换。
   return {...result,diagnostic:diagnostic??undefined,detail:[...trace,result.message].join("\n")};
 }
