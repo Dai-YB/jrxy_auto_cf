@@ -99,7 +99,8 @@ async function loadStatus(updateForm=false) {
   $("scheduleBadge").className="pill "+(status.scheduler.enabled?"ok":"neutral");
   $("scheduleNext").textContent=status.scheduler.enabled?"下次 "+status.scheduler.next:"自动签到已关闭";
   $("timezoneLabel").textContent=status.timezone;
-  $("scheduleNote").textContent=status.scheduler.enabled?"下次执行："+status.scheduler.next+"（"+status.timezone+"）":"当前未开启自动签到";
+  $("scheduleNote").textContent=(status.scheduler.enabled?"下次执行："+status.scheduler.next+"（"+status.timezone+"）":"当前未开启自动签到")+
+    `；首次执行后最多重试${status.scheduler.maxRetries}次，每轮全部结束后等待${status.scheduler.retryDelayMinutes}分钟；手动单次执行。`;
   $("lastRun").textContent=status.scheduler.last_run?"上次："+status.scheduler.last_run+" · "+status.scheduler.last_result:"";
   if(updateForm||!scheduleDirty){$("scheduleEnabled").checked=status.scheduler.enabled;$("scheduleInput").value=status.scheduler.time;}
   if(updateForm||!executionDirty)$("parallelism").value=String(status.execution.parallelism);
@@ -185,7 +186,7 @@ async function loadEnrollments(){
   const data=await api("/api/redemption/attempts");if(!signedIn)return;
   $("enrollmentList").replaceChildren();$("enrollmentEmpty").hidden=data.attempts.length>0;
   const states={pending:"等待验证",verifying:"验证中",ready:"正在保存",succeeded:"已开通",failed:"未开通"};
-  const stages={request:"上游请求",tenant_list:"获取学校列表",tenant_info:"获取学校信息",portal:"打开校园入口及跳转",login_form:"解析学校登录页",login_ticket:"获取登录票据",captcha_check:"检查验证码",login_submit:"提交学校登录",login_callback:"登录回跳",setup:"准备或保存账号"};
+  const stages={request:"上游请求",tenant_list:"获取学校列表",tenant_info:"获取学校信息",portal:"打开校园入口及跳转",login_form:"解析学校登录页",login_ticket:"获取登录票据",captcha_check:"检查验证码",login_submit:"提交学校登录",login_callback:"登录回跳",task_list:"查询任务列表",task_detail:"获取任务详情",secret:"动态密钥协商",submit:"提交签到",confirmation:"复查原任务",setup:"准备或保存账号"};
   const kinds={timeout:"单次请求超时",total_timeout:"总网络时限已到",transport:"发送失败，未取得响应（DNS / TLS / 连接原因待核实）",body_read:"已取得响应，正文读取中断",response_processing:"已取得响应，响应头或内容处理错误",http:"上游HTTP异常",response:"响应或登录校验未通过",request_limit:"请求次数超限",redirect_limit:"重定向次数超限",policy:"地址或跨域请求不符合安全规则",internal:"内部处理异常"};
   for(const attempt of data.attempts){
     const item=element("details",undefined,"log-entry"),summary=element("summary"),info=element("div",undefined,"log-text");
@@ -229,7 +230,7 @@ async function removeAccount(account) {
 function persistTasks() { sessionStorage.setItem(pendingKey,JSON.stringify([...pending.values()].map(({ids,mode})=>({ids,mode,label:(modes[mode]||"任务")+" · "+ids.length+"个账号"})))); }
 function trackTask(ids,mode,label,resolve,reject) {
   const key=ids.join(",");pending.set(key,{ids,mode,label,resolve,reject});visibleTaskKey=key;persistTasks();
-  $("taskResult").hidden=false;$("taskTitle").textContent=label;$("taskDetail").textContent="任务已提交，等待执行…";
+  $("taskResult").hidden=false;$("taskTitle").textContent=label;$("taskDetail").textContent="正在读取任务进度；已有签到或重试任务会直接接续展示，不重复创建…";
 }
 async function runTask(path,mode,label) {
   const result=await api(path,"POST",{mode});
@@ -240,6 +241,23 @@ async function runAccount(name,mode) {
   const account=accounts.find(item=>item.name===name),label=accountName(name);
   if(mode==="submit"&&!await confirmAction("确认签到？",`将对「${label}」（${account?.username||name}）执行真实签到。请确认位置及账号配置正确。`,"开始签到"))return;
   return runTask(`/api/accounts/${encodeURIComponent(name)}/run`,mode,`${modes[mode]} · ${label}`);
+}
+function jobProgress(job) {
+  const finished=job.progressState==="finished",attempt=job.attempts||0;
+  const retry=job.progressState==="running"?Math.max(0,attempt-1):attempt;
+  const phase=job.progressState==="reporting"?"正在保存报告（不会重跑签到）":finished?"已结束 · "+(job.result?.status==="success"&&job.mode==="login"?"登录成功":job.result?.status==="success"&&job.mode==="range"?"范围已获取并应用":labels[job.result?.status]||"结果未确认"):
+    job.progressState==="waiting_round"?"本轮已结束，等待其他账号完成后再计时":
+    job.progressState==="running"?(job.verificationPending?"正在复查原提交（不重签）":retry?`第${retry}次重试执行中`:"首次执行中"):
+    job.progressState==="retry_pending"?(job.verificationPending?`第${retry}次重试待执行（仅复查）`:`第${retry}次重试待执行`):"等待执行";
+  const lines=[`${accountName(job.account)}：${phase}`,`本账号已执行 ${attempt}/${job.max_attempts} 次；批次第${job.round}轮 · 本批并发${job.concurrency_limit}`];
+  if(!finished)lines.push(`剩余执行机会：${job.remainingAttempts}次`);
+  if(job.nextAttemptText&&!finished)lines.push("下一次最早执行："+job.nextAttemptText+`（${job.timezone||"服务时区"}；仍需等待同组和执行位）`);
+  if(job.fallback_reason)lines.push("并发调整："+job.fallback_reason+"；全局设置不变");
+  if(job.verificationPending)lines.push("原提交尚未确认：只复查同一任务，确认未签后才能再次提交。");
+  if(job.result?.status==="no_task")lines.push("当前未查到待签任务，不是签到成功；请核对官方任务窗口和签到类型。");
+  if(finished&&!["success","already","dry"].includes(job.result?.status))lines.push("任务已结束不代表签到成功，请核对上述结果。");
+  if(job.result?.detail||job.result?.message)lines.push(job.result.detail||job.result.message);
+  return lines.join("\n");
 }
 async function pollJobs() {
   if(!signedIn||pollBusy||!pending.size)return;
@@ -256,8 +274,8 @@ async function pollJobs() {
       }
       const done=jobs.filter(job=>job.status==="done").length;
       if(key===visibleTaskKey) {
-        $("taskTitle").textContent=task.label+(done===jobs.length?" · 已完成":` · ${done}/${jobs.length}`);
-        $("taskDetail").textContent=jobs.map(job=>`${accountName(job.account)}：${job.status==="done"?(labels[job.result?.status]||"已完成"):job.status==="running"?"执行中":"等待执行"}\n${job.result?.detail||job.result?.message||""}`).join("\n\n");
+        $("taskTitle").textContent=task.label+(done===jobs.length?" · 已结束（请核对结果）":` · 已结束 ${done}/${jobs.length}`);
+        $("taskDetail").textContent=jobs.map(jobProgress).join("\n\n");
       }
       if(done===jobs.length){pending.delete(key);persistTasks();task.resolve?.(jobs);await Promise.all([loadLogs(),loadAccounts(),loadStatus()]);}
     }

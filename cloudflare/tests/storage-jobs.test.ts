@@ -102,7 +102,7 @@ describe("durable queue", () => {
     await bindings.DB.prepare("UPDATE jobs SET status='running',lease_until=?,checkpoint=?,attempts=1 WHERE id=?")
       .bind(Date.now()-1000, JSON.stringify(checkpoint), id).run();
     await dispatch(testEnv);
-    expect(testEnv.JOBS.send).toHaveBeenCalledWith({id});
+    expect(testEnv.JOBS.send).toHaveBeenCalledWith({id,deliveryToken:expect.any(String)});
     const run = vi.fn().mockResolvedValue({ status: "uncertain", message: "需人工核实" });
     await processJob(testEnv, id, run);
     expect(run.mock.calls[0][3].checkpoint).toEqual(checkpoint);

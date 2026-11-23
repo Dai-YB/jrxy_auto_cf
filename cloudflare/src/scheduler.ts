@@ -42,7 +42,8 @@ export async function scheduleView(env: Env): Promise<Record<string, unknown>> {
   return { enabled: Boolean(s.enabled), autoEnableOnEnrollment: !s.enabled && s.revision===1, time: s.time, timezone: `UTC${cfg.timezone >= 0 ? "+" : ""}${cfg.timezone}`,
     next: s.enabled ? localTime(next, cfg.timezone) : null, last_slot: s.last_slot,
     last_run: s.last_run ? localTime(s.last_run, cfg.timezone) : null, last_result: s.last_result,
-    note: "按分钟触发；已开始的批次会继续，后续重试与通知不依赖页面连接" };
+    maxRetries:cfg.maxAttempts-1,retryDelayMinutes:cfg.retryMs/60000,
+    note: "按分钟触发；所有账号完成一轮后才重试，已开始的批次会继续，不依赖页面连接" };
 }
 export async function updateSchedule(env: Env, body: Record<string, unknown>): Promise<Record<string, unknown>> {
   const s = await getSchedule(env);
@@ -78,9 +79,9 @@ export async function tick(env: Env, now = Date.now()): Promise<void> {
         (SELECT 1 FROM schedule WHERE id=1 AND revision=? AND enabled=1 AND last_slot IS NOT ?)
         AND NOT EXISTS(SELECT 1 FROM batches WHERE trigger='schedule' AND finished_at IS NULL)`)
         .bind(id, label, now, now, s.revision, String(slot)),
-      env.DB.prepare(`INSERT OR IGNORE INTO jobs(id,account,mode,trigger,max_attempts,next_at,created_at,trigger_label,batch_id,sequence_no,account_version,priority,wave_no)
+      env.DB.prepare(`INSERT OR IGNORE INTO jobs(id,account,mode,trigger,max_attempts,next_at,created_at,trigger_label,batch_id,sequence_no,account_version,priority,wave_no,checkpoint,target)
         SELECT ? || ':' || name,name,'submit','schedule',?,?,?,?,?,ROW_NUMBER() OVER(ORDER BY priority DESC,name)-1,pause_version,priority,
-          CAST((ROW_NUMBER() OVER(PARTITION BY priority ORDER BY name)-1)/(SELECT concurrency_limit FROM batches WHERE id=?) AS INTEGER)
+          CAST((ROW_NUMBER() OVER(PARTITION BY priority ORDER BY name)-1)/(SELECT concurrency_limit FROM batches WHERE id=?) AS INTEGER),submission_checkpoint,submission_checkpoint
         FROM accounts WHERE deleted=0 AND paused=0 AND resume_after<? AND (authorization_until IS NULL OR authorization_until>?) AND EXISTS(SELECT 1 FROM batches WHERE id=? AND finished_at IS NULL)
         AND EXISTS(SELECT 1 FROM schedule WHERE id=1 AND revision=? AND enabled=1 AND last_slot IS NOT ?)`)
         .bind(id, cfg.maxAttempts, now, now, label, id, id, slot,now, id, s.revision, String(slot)),

@@ -128,16 +128,20 @@ export default {
     catch (e) { return json({ detail: e instanceof AppError ? e.message : "内部处理失败，请检查数据库迁移与服务配置" }, e instanceof AppError ? e.code : 500); }
   },
   async scheduled(controller: ScheduledController, env: Env): Promise<void> { await tick(env, controller.scheduledTime); },
-  async queue(batch: MessageBatch<{ id: string;kind?:"enrollment" }>, env: Env): Promise<void> {
+  async queue(batch: MessageBatch<{ id: string;kind?:"enrollment";deliveryToken?:string }>, env: Env): Promise<void> {
     for (const message of batch.messages) {
       try {
-        if (typeof message.body?.id !== "string" || message.body.id.length > 200) { message.ack(); continue; }
+        if (typeof message.body?.id !== "string" || message.body.id.length > 200 ||
+          (message.body.deliveryToken!==undefined&&(typeof message.body.deliveryToken!=="string"||message.body.deliveryToken.length>100))) { message.ack(); continue; }
         if(message.body.kind==="enrollment")await processEnrollment(env,message.body.id);
-        else if(message.body.kind===undefined)await processJob(env, message.body.id);
-        else {message.ack();continue;}
-        message.ack();
-        await dispatch(env);await dispatchEnrollments(env);
-      } catch { message.retry({ delaySeconds: 60 }); }
+        else if(message.body.kind===undefined){
+          const deferred=await processJob(env,message.body.id,undefined,message.body.deliveryToken??null);
+          if(deferred){message.retry({delaySeconds:deferred.retryAfter});continue;}
+        }else {message.ack();continue;}
+      } catch { message.retry({ delaySeconds: 60 });continue; }
+      message.ack();
+      // 学校执行已持久化；后续派发失败交由Cron修复，不能重试已确认的消息。
+      try{await dispatch(env);await dispatchEnrollments(env);}catch{}
     }
   }
-} satisfies ExportedHandler<Env, { id: string;kind?:"enrollment" }>;
+} satisfies ExportedHandler<Env, { id: string;kind?:"enrollment";deliveryToken?:string }>;

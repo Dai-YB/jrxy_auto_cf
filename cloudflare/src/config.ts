@@ -8,7 +8,7 @@ export function settings(env: Env) {
     retryMs: env.RETRY_DELAY_SECONDS !== undefined
       ? boundedInt(env.RETRY_DELAY_SECONDS, 300, 1, 86400) * 1000
       : (Number.isFinite(minutes) && minutes >= 0 && minutes <= 1440 ? minutes : 5) * 60_000,
-    maxAttempts: 1 + boundedInt(env.MAX_RETRIES, 2, 0, 10),
+    maxAttempts: 1 + boundedInt(env.MAX_RETRIES, 5, 0, 10),
     catchupMs: boundedInt(env.CATCHUP_MINUTES, 120, 1, 1440) * 60_000,
     httpTimeoutMs: boundedInt(env.JRXY_HTTP_TIMEOUT, 30, 1, 120) * 1000,
     runTimeoutMs: boundedInt(env.JRXY_RUN_TIMEOUT, 300, 10, 600) * 1000,

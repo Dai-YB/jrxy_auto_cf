@@ -38,6 +38,25 @@ describe("non-destructive administrator upgrade",()=>{
     expect((await e.DB.prepare("SELECT parallelism FROM execution_settings").first<any>()).parallelism).toBe(1);
     expect(await e.DB.prepare("SELECT owner,lease_until FROM execution_gate").first()).toEqual({owner:"old-owner",lease_until:12345});
   });
+  it("migrates only the latest unresolved submit and keeps old retry budgets",async()=>{
+    await reset();await applyD1Migrations(e.DB,e.TEST_MIGRATIONS.slice(0,8));
+    const checkpoint=JSON.stringify({signInstanceWid:"old-target",signWid:"old-sign"});
+    for(const name of ["unresolved","resolved","queued","empty-list"]){
+      await e.DB.prepare("INSERT INTO accounts(name,config,device_id,created_at) VALUES(?,'','fixed-device',1)").bind(name).run();
+      await e.DB.prepare("INSERT INTO jobs(id,account,mode,trigger,status,next_at,created_at,checkpoint,result,max_attempts) VALUES(?,?,'submit','schedule','done',1,1,?,?,3)")
+        .bind(name+"-old",name,checkpoint,JSON.stringify({status:"uncertain",message:"unknown"})).run();
+    }
+    await e.DB.prepare("INSERT INTO jobs(id,account,mode,trigger,status,next_at,created_at,result) VALUES('resolved-new','resolved','submit','manual','done',2,2,?)")
+      .bind(JSON.stringify({status:"success",message:"confirmed"})).run();
+    await e.DB.prepare("INSERT INTO jobs(id,account,mode,trigger,status,next_at,created_at) VALUES('queued-new','queued','submit','schedule','pending',2,2)").run();
+    await e.DB.prepare("INSERT INTO jobs(id,account,mode,trigger,status,next_at,created_at,result) VALUES('empty-new','empty-list','submit','manual','done',2,2,?)")
+      .bind(JSON.stringify({status:"no_task",message:"no evidence"})).run();
+    await applyD1Migrations(e.DB,e.TEST_MIGRATIONS);
+    for(const name of ["queued","empty-list"])expect(await e.DB.prepare("SELECT submission_checkpoint FROM accounts WHERE name=?").bind(name).first("submission_checkpoint")).toBe(checkpoint);
+    expect(await e.DB.prepare("SELECT submission_checkpoint FROM accounts WHERE name='unresolved'").first("submission_checkpoint")).toBe(checkpoint);
+    expect(await e.DB.prepare("SELECT submission_checkpoint FROM accounts WHERE name='resolved'").first("submission_checkpoint")).toBeNull();
+    expect(await e.DB.prepare("SELECT max_attempts FROM jobs WHERE id='unresolved-old'").first("max_attempts")).toBe(3);
+  });
   it("preserves old encrypted accounts, device IDs, plans and logs",async()=>{
     await reset();await applyD1Migrations(e.DB,e.TEST_MIGRATIONS.slice(0,3));
     const config=await seal({schoolName:"旧学校",username:"old-user",password:"original-password",type:2,lon:1,lat:2,address:"地址",abnormalReason:"",notifyKey:"SCTold"},e.ENCRYPTION_KEY,"account:old");

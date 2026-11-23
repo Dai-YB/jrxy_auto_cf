@@ -104,6 +104,8 @@ export async function saveAccount(env: Env, name: string, body: Record<string, u
   if(old && !old.deleted && !accountValid(old))throw new AppError("账号授权已到期，不能编辑或重新激活",410);
   if(old?.grant_code_id && oldConfig && (account.schoolName!==oldConfig.schoolName || account.username!==oldConfig.username))
     throw new AppError("授权账号不能更换绑定学校或账号");
+  if(old?.submission_checkpoint&&oldConfig&&(account.schoolName!==oldConfig.schoolName||account.username!==oldConfig.username||account.type!==oldConfig.type))
+    throw new AppError("该账号仍有提交待确认，不能更换学校、身份或任务类型；请先核实原任务",409);
   const identity = identityKey(env,account.schoolName,account.username);
   const duplicate = await env.DB.prepare("SELECT name FROM accounts WHERE identity_key=? AND name!=? AND deleted=0 AND (authorization_until IS NULL OR authorization_until>?) LIMIT 1")
     .bind(identity,name,Date.now()).first();
@@ -131,7 +133,7 @@ export async function saveAccount(env: Env, name: string, body: Record<string, u
 export async function deleteAccount(env: Env, name: string): Promise<void> {
   const granted=await env.DB.prepare("SELECT grant_code_id FROM accounts WHERE name=? AND deleted=0").bind(name).first<{grant_code_id:string|null}>();
   if(granted?.grant_code_id){await purgeGrantedAccount(env,name);return;}
-  const row = await env.DB.prepare(`UPDATE accounts SET deleted=1,config='' WHERE name=? AND deleted=0
+  const row = await env.DB.prepare(`UPDATE accounts SET deleted=1,config='',submission_checkpoint=NULL WHERE name=? AND deleted=0
     AND NOT EXISTS(SELECT 1 FROM jobs WHERE account=? AND (status!='done' OR report_pending=1)) RETURNING name`).bind(name, name).first();
   if (!row) throw new AppError("账号不存在或仍有待执行任务", 409);
   await saveLog(env, name, "账号管理", "账号已删除", "已清除账号凭据，仅保留名称与设备绑定供重新接入");

@@ -140,7 +140,7 @@ export async function revokeCodes(env:Env,id:string,batch=false):Promise<{revoke
       WHERE status IN('pending','verifying','ready') AND code_id IN(SELECT id FROM redemption_codes WHERE ${column}=? AND status='revoked')`).bind(id),
     env.DB.prepare(`UPDATE redemption_codes SET attempt_id=NULL,reserved_until=NULL WHERE ${column}=? AND status='revoked'`).bind(id)
   ]);
-  await env.DB.prepare(`UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0 WHERE kind='enrollment' AND owner IS NULL
+  await env.DB.prepare(`UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0,delivery_token=NULL WHERE kind='enrollment' AND owner IS NULL
     AND task_id IN(SELECT e.id FROM enrollment_attempts e JOIN redemption_codes c ON c.id=e.code_id WHERE c.${column}=? AND c.status='revoked')`).bind(id).run();
   await syncGate(env);
   return {revoked:rows[0].results.length};

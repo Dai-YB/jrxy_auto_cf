@@ -1,6 +1,6 @@
 import type { RequestDiagnostic, RequestStage } from "./types";
 
-const stages: RequestStage[] = ["request","tenant_list","tenant_info","portal","login_form","login_ticket","captcha_check","login_submit","login_callback","setup"];
+const stages: RequestStage[] = ["request","tenant_list","tenant_info","portal","login_form","login_ticket","captcha_check","login_submit","login_callback","task_list","task_detail","secret","submit","confirmation","setup"];
 const kinds: RequestDiagnostic["kind"][] = ["timeout","total_timeout","transport","body_read","response_processing","http","response","request_limit","redirect_limit","policy","internal"];
 // 仅保存白名单元数据；绝不序列化Error、URL、请求/响应内容。
 export function safeDiagnostic(value: unknown, privateValues: string[] = []): RequestDiagnostic | null {

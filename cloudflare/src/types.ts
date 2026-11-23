@@ -1,6 +1,6 @@
 export interface Env {
   DB: D1Database;
-  JOBS: Queue<{ id: string; kind?: "enrollment" }>;
+  JOBS: Queue<{ id: string; kind?: "enrollment"; deliveryToken?: string }>;
   ASSETS: Fetcher;
   ADMIN_USERNAME: string;
   ADMIN_PASSWORD: string;
@@ -49,6 +49,7 @@ export interface AccountRow {
   grant_code_id: string | null;
   authorization_from: number | null;
   authorization_until: number | null;
+  submission_checkpoint: string | null;
 }
 export type Mode = "dry" | "submit" | "login" | "range";
 export interface Result {
@@ -56,6 +57,10 @@ export interface Result {
   message: string;
   detail?: string;
   retryable?: boolean;
+  retryAction?: "execute" | "verify";
+  submissionState?: "signed" | "unsigned" | "unknown";
+  transientFailure?: boolean;
+  diagnostic?: RequestDiagnostic;
   data?: Record<string, unknown>;
 }
 export interface Job {
@@ -78,6 +83,7 @@ export interface Job {
   lease_until: number;
   owner: string | null;
   checkpoint: string | null;
+  target: string | null;
   result: string | null;
   notified: number;
   report_pending: number;
@@ -100,6 +106,7 @@ export interface Batch {
   detail: string | null;
   privacy_version: number;
   concurrency_limit: number;
+  fallback_reason: string | null;
 }
 export interface Schedule {
   id: number;
@@ -116,7 +123,7 @@ export interface Schedule {
 export class AppError extends Error {
   constructor(message: string, public code = 400) { super(message); }
 }
-export type RequestStage = "request" | "tenant_list" | "tenant_info" | "portal" | "login_form" | "login_ticket" | "captcha_check" | "login_submit" | "login_callback" | "setup";
+export type RequestStage = "request" | "tenant_list" | "tenant_info" | "portal" | "login_form" | "login_ticket" | "captcha_check" | "login_submit" | "login_callback" | "task_list" | "task_detail" | "secret" | "submit" | "confirmation" | "setup";
 export interface RequestDiagnostic {
   stage: RequestStage;
   kind: "timeout" | "total_timeout" | "transport" | "body_read" | "response_processing" | "http" | "response" | "request_limit" | "redirect_limit" | "policy" | "internal";

@@ -93,7 +93,7 @@ describe("only attendance and sign", () => {
     expect(result.status).toBe("success");expect(result.data?.cookies).toEqual(["MOD_AUTH_CAS"]);expect(fake.json).not.toHaveBeenCalled();
   });
   it("dry run never submits or uploads and protects secrets", async () => {
-    const fake=fakeLogin(url=>url.includes("getStu")?{datas:{unSignedTasks:[task],signedTasks:[]}}:url.includes("detailSign")?{datas:task}:secretResponse());
+    const fake=fakeLogin(url=>url.includes("getStu")?{datas:{unSignedTasks:[task],leaveTasks:[],signedTasks:[]}}:url.includes("detailSign")?{datas:task}:secretResponse());
     const beforeSubmit=vi.fn();
     const result=await execute(user,"device","dry",{loginFn:fake.fn,beforeSubmit});
     expect(result.status).toBe("dry"); expect(beforeSubmit).not.toHaveBeenCalled();
@@ -101,24 +101,24 @@ describe("only attendance and sign", () => {
     expect(JSON.stringify(result)).not.toContain("auth-cookie");
   });
   it("handles no task and already signed without requesting keys", async () => {
-    const fake=fakeLogin(()=>({datas:{unSignedTasks:[],signedTasks:[]}}));
+    const fake=fakeLogin(()=>({datas:{unSignedTasks:[],leaveTasks:[],signedTasks:[]}}));
     expect((await execute(user,"device","dry",{loginFn:fake.fn})).status).toBe("no_task");
     expect(fake.json).toHaveBeenCalledTimes(1);
-    const done=fakeLogin(()=>({datas:{unSignedTasks:[],signedTasks:[task]}}));
+    const done=fakeLogin(()=>({datas:{unSignedTasks:[],leaveTasks:[],signedTasks:[task]}}));
     expect((await execute(user,"device","submit",{loginFn:done.fn})).status).toBe("already");
   });
   it("returns a clear range error for no tasks and refuses malformed lists",async()=>{
-    const empty=fakeLogin(()=>({datas:{unSignedTasks:[],signedTasks:[]}}));
+    const empty=fakeLogin(()=>({datas:{unSignedTasks:[],leaveTasks:[],signedTasks:[]}}));
     expect((await execute(user,"device","range",{loginFn:empty.fn})).status).toBe("fail");
-    const malformed=fakeLogin(()=>({datas:{unSignedTasks:[],signedTasks:"unexpected"}}));
+    const malformed=fakeLogin(()=>({datas:{unSignedTasks:[],leaveTasks:[],signedTasks:"unexpected"}}));
     const result=await execute(user,"device","submit",{loginFn:malformed.fn});
-    expect(result.status).toBe("fail");expect(result.message).toContain("结构异常");
+    expect(result.status).toBe("error");expect(result.retryable).toBe(true);expect(result.message).toContain("结构异常");
     expect(malformed.json).toHaveBeenCalledTimes(1);
   });
   it("persists checkpoint before submission and confirms timeout using task state", async () => {
     let queried=0; let saved=false;
     const fake=fakeLogin(url=>{
-      if(url.includes("getStu")) return {datas:++queried===1?{unSignedTasks:[task],signedTasks:[]}:{unSignedTasks:[],signedTasks:[task]}};
+      if(url.includes("getStu")) return {datas:++queried===1?{unSignedTasks:[task],leaveTasks:[],signedTasks:[]}:{unSignedTasks:[],leaveTasks:[],signedTasks:[task]}};
       if(url.includes("detailSign"))return{datas:task};
       if(url.includes("submitSign")){expect(saved).toBe(true);throw new Error("timeout");}
       return secretResponse();
@@ -128,14 +128,15 @@ describe("only attendance and sign", () => {
     expect(fake.json.mock.calls.filter(([url])=>url.includes("submitSign"))).toHaveLength(1);
   });
   it("allows scheduled retry only after confirming the same task is still unsigned",async()=>{
-    const fake=fakeLogin(()=>({datas:{unSignedTasks:[task],signedTasks:[]}}));
+    const fake=fakeLogin(()=>({datas:{unSignedTasks:[task],leaveTasks:[],signedTasks:[]}}));
     const result=await execute(user,"device","submit",{loginFn:fake.fn,checkpoint:{signInstanceWid:"instance",signWid:"sign"}});
     expect(result.status).toBe("error");expect(result.retryable).toBe(true);
     expect(fake.json.mock.calls.some(([url])=>url.includes("submitSign"))).toBe(false);
   });
   it("never resubmits a resumed job with unknown state",async()=>{
-    const fake=fakeLogin(()=>({datas:{unSignedTasks:[],signedTasks:[]}}));
+    const fake=fakeLogin(()=>({datas:{unSignedTasks:[],leaveTasks:[],signedTasks:[]}}));
     const result=await execute(user,"device","submit",{loginFn:fake.fn,checkpoint:{signInstanceWid:"instance",signWid:"sign"}});
-    expect(result.status).toBe("uncertain");expect(result.retryable).not.toBe(true);expect(fake.json).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe("uncertain");expect(result.retryable).toBe(true);expect(result.retryAction).toBe("verify");expect(fake.json).toHaveBeenCalledTimes(1);
+    expect(fake.json.mock.calls.some(([url])=>url.includes("submitSign"))).toBe(false);
   });
 });

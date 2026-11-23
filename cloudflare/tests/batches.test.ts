@@ -40,7 +40,7 @@ describe("durable batches",()=>{
     const [a,b]=await enqueue(e,["a","b"],"dry","批量");
     const run=vi.fn().mockResolvedValue({status:"dry",message:"ok"});await processJob(e,a,run);
     await dispatch(e);
-    expect(e.JOBS.send).toHaveBeenCalledWith({id:b},{delaySeconds:expect.any(Number)});
+    expect(e.JOBS.send).toHaveBeenCalledWith({id:b,deliveryToken:expect.any(String)},{delaySeconds:expect.any(Number)});
     const delay=(e.JOBS.send as any).mock.calls[0][1].delaySeconds;
     expect(delay).toBeGreaterThan(0);expect(delay).toBeLessThanOrEqual(10);
   });

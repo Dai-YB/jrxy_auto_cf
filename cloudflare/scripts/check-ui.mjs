@@ -35,4 +35,13 @@ assert.match(userHtml,/<input id="sendKey"[^>]*type="password"/);
 assert.match(userHtml,/href="https:\/\/sct\.ftqq\.com\/login"[^>]*target="_blank"[^>]*rel="noopener noreferrer"/);
 assert.match(html,/<input id="codeDuration"[^>]*value="24"/);
 assert.ok(!userHtml.includes("兑换码")&&!html.includes("兑换码"),"用户可见码名称统一为授权码");
-console.log("UI contract passed: separate user/admin pages, safe scripts, authorization code pagination, opt-in notification guide, priorities and execution settings.");
+const progress=js.slice(js.indexOf("function jobProgress(job)"),js.indexOf("async function pollJobs()"));
+const render=new Script(`const labels={success:'签到成功',no_task:'暂无待签任务',uncertain:'提交状态待确认',error:'执行异常'};const accountName=name=>name;${progress};jobProgress`)
+  .runInNewContext();
+const sample={account:"模拟",attempts:1,max_attempts:6,round:2,concurrency_limit:1,remainingAttempts:5,nextAttemptText:"2026-01-01 22:10:00",fallback_reason:"上游异常改串行",verificationPending:true,result:{status:"uncertain",message:"unknown"}};
+assert.match(render({...sample,progressState:"retry_pending"}),/第1次重试待执行（仅复查）/);
+assert.match(render({...sample,progressState:"waiting_round"}),/等待其他账号完成/);
+assert.match(render({...sample,progressState:"reporting"}),/不会重跑签到/);
+assert.match(render({...sample,progressState:"finished",result:{status:"no_task"}}),/不是签到成功/);
+assert.match(render({...sample,progressState:"finished",result:{status:"error"}}),/不代表签到成功/);
+console.log("UI contract passed: safe user/admin pages, authorization management, concurrency and evidence-aware retry progress.");

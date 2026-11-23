@@ -1,0 +1,219 @@
+{
+  "source": "web-server/app.py:_fire",
+  "originalDefaultRetries": 2,
+  "requestedRetries": 5,
+  "scenarios": [
+    {
+      "name": "recover",
+      "outcomes": {
+        "a": [
+          "执行异常",
+          "执行异常",
+          "执行异常",
+          "执行异常",
+          "执行异常",
+          "签到成功"
+        ],
+        "b": [
+          "签到成功"
+        ],
+        "c": [
+          "签到失败"
+        ],
+        "d": [
+          "执行异常",
+          "签到成功"
+        ]
+      },
+      "events": [
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 0,
+          "attempt": 1
+        },
+        {
+          "kind": "run",
+          "account": "b",
+          "at": 10,
+          "attempt": 1
+        },
+        {
+          "kind": "run",
+          "account": "c",
+          "at": 20,
+          "attempt": 1
+        },
+        {
+          "kind": "run",
+          "account": "d",
+          "at": 30,
+          "attempt": 1
+        },
+        {
+          "kind": "wait",
+          "at": 30,
+          "due": 330
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 330,
+          "attempt": 2
+        },
+        {
+          "kind": "run",
+          "account": "d",
+          "at": 340,
+          "attempt": 2
+        },
+        {
+          "kind": "wait",
+          "at": 340,
+          "due": 640
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 640,
+          "attempt": 3
+        },
+        {
+          "kind": "wait",
+          "at": 640,
+          "due": 940
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 940,
+          "attempt": 4
+        },
+        {
+          "kind": "wait",
+          "at": 940,
+          "due": 1240
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 1240,
+          "attempt": 5
+        },
+        {
+          "kind": "wait",
+          "at": 1240,
+          "due": 1540
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 1540,
+          "attempt": 6
+        }
+      ],
+      "attempts": {
+        "a": 6,
+        "b": 1,
+        "c": 1,
+        "d": 2
+      },
+      "summary": "签到成功 3 / 签到失败 1"
+    },
+    {
+      "name": "exhaust",
+      "outcomes": {
+        "a": [
+          "执行异常"
+        ],
+        "b": [
+          "暂无待签任务"
+        ],
+        "c": [
+          "今日已签到"
+        ]
+      },
+      "events": [
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 0,
+          "attempt": 1
+        },
+        {
+          "kind": "run",
+          "account": "b",
+          "at": 10,
+          "attempt": 1
+        },
+        {
+          "kind": "run",
+          "account": "c",
+          "at": 20,
+          "attempt": 1
+        },
+        {
+          "kind": "wait",
+          "at": 20,
+          "due": 320
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 320,
+          "attempt": 2
+        },
+        {
+          "kind": "wait",
+          "at": 320,
+          "due": 620
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 620,
+          "attempt": 3
+        },
+        {
+          "kind": "wait",
+          "at": 620,
+          "due": 920
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 920,
+          "attempt": 4
+        },
+        {
+          "kind": "wait",
+          "at": 920,
+          "due": 1220
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 1220,
+          "attempt": 5
+        },
+        {
+          "kind": "wait",
+          "at": 1220,
+          "due": 1520
+        },
+        {
+          "kind": "run",
+          "account": "a",
+          "at": 1520,
+          "attempt": 6
+        }
+      ],
+      "attempts": {
+        "a": 6,
+        "b": 1,
+        "c": 1
+      },
+      "summary": "执行异常 1 / 暂无待签任务 1 / 今日已签到 1"
+    }
+  ]
+}

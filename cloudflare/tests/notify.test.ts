@@ -34,6 +34,24 @@ describe("original notification behavior",()=>{
     transport.mockResolvedValue(new Response('unavailable',{status:503}));
     expect(await sendNotify(account,"标题","正文",transport)).toContain("HTTP 503 unavailable");
   });
+  it.each(["headers","body","cancel"])("bounds a notification that ignores abort during %s",async phase=>{
+    vi.useFakeTimers();
+    const late=Promise.withResolvers<Response>();let control:ReadableStreamDefaultController<Uint8Array>|undefined;
+    const cancelled=vi.fn(()=>phase==="cancel"?new Promise<void>(()=>{}):undefined);
+    const response=new Response(new ReadableStream<Uint8Array>({start(controller){control=controller;if(phase==="cancel")controller.enqueue(new Uint8Array(32769));},cancel:cancelled}));
+    const transport=vi.fn(async()=>phase==="headers"?late.promise:response);
+    let outcome:string|undefined;
+    const pending=sendNotify(account,"标题","正文",transport).then(value=>{outcome=value;});
+    try{
+      await vi.advanceTimersByTimeAsync(15001);
+      expect(outcome).toContain("推送失败");expect(transport).toHaveBeenCalledTimes(1);
+      if(phase==="headers"){late.resolve(response);await vi.advanceTimersByTimeAsync(0);}
+      expect(cancelled).toHaveBeenCalledTimes(1);
+      await pending;
+    }finally{
+      late.resolve(response);try{control?.close();}catch{}vi.useRealTimers();
+    }
+  });
   it("disabled methods do not send and responses redact secrets",async()=>{
     const transport=vi.fn();
     expect(await sendNotify({...account,notifyOption:{method:0,rcvOption:"SCTexample"}},"t","m",transport)).toContain("推送未启用");

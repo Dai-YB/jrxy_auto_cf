@@ -4,10 +4,15 @@ import { fetchSecret, signedBody } from "./crypto";
 import { login, type Login } from "./login";
 import { requireDeviceId } from "./device";
 import { IOS_UA, Session } from "./http";
+import { localTime } from "../config";
+import { safeDiagnostic } from "../diagnostics";
 
 export interface Checkpoint { signInstanceWid: string; signWid: string; }
 export interface ExecutionOptions {
   checkpoint?: Checkpoint;
+  target?: Checkpoint;
+  onTarget?: (target: Checkpoint) => Promise<void>;
+  timezone?: number;
   beforeSubmit?: (checkpoint: Checkpoint) => Promise<void>;
   loginFn?: typeof login;
   httpTimeoutMs?: number;
@@ -25,17 +30,35 @@ export function paths(type: 1 | 2): { list: string; detail: string; submit: stri
     submit: "wec-counselor-attendance-apps/student/attendance/submitSign"
   };
 }
+function rejected(response: any): boolean {
+  if (!response || typeof response!=="object" || Array.isArray(response)) return true;
+  if (response.success===false) return true;
+  return response.code!==undefined && ![0,"0",200,"200","SUCCESS"].includes(response.code);
+}
 async function tasks(auth: Login, path: string, warmup = false): Promise<any> {
   if (warmup) await auth.session.request(auth.host + path,{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
   const response = await auth.session.json(auth.host + path, {});
-  if (response?.datas && Array.isArray(response.datas.unSignedTasks)) {
-    const data=response.datas;
-    for(const key of ["signedTasks","leaveTasks","registerLeaveTasks"]) {
-      if(data[key]!=null && !Array.isArray(data[key]))throw new EngineError("任务列表结构异常，已停止执行");
-    }
-    return {...data,signedTasks:data.signedTasks ?? [],leaveTasks:data.leaveTasks ?? [],registerLeaveTasks:data.registerLeaveTasks ?? []};
+  if(rejected(response))throw new EngineError("任务列表接口返回业务异常，不能判为暂无任务","error",true);
+  const data=response.datas;
+  if(!data || !Array.isArray(data.unSignedTasks) || !Array.isArray(data.leaveTasks))
+    throw new EngineError("任务列表结构不完整，未签或请假列表缺失，不能判为暂无任务","error",true);
+  for(const key of ["unSignedTasks","leaveTasks","signedTasks","registerLeaveTasks"]){
+    if(data[key]!==undefined && (!Array.isArray(data[key]) || data[key].some((item:any)=>!item||typeof item!=="object"||!item.signInstanceWid)))
+      throw new EngineError("任务列表结构异常，已停止执行","error",true);
   }
-  throw new EngineError("未能获取受保护的任务列表，登录可能失效或学校接口不兼容");
+  return {...data,signedTasks:data.signedTasks??[],registerLeaveTasks:data.registerLeaveTasks??[]};
+}
+function listEvidence(list:any,account:Account,trace:string[],timezone=8):void {
+  trace.push(`任务查询：${account.type===1?"签到":"查寝"}；${localTime(Date.now(),timezone)}（UTC${timezone>=0?"+":""}${timezone}）；未签${list.unSignedTasks.length}、请假${list.leaveTasks.length}、已签${list.signedTasks.length}、登记请假${list.registerLeaveTasks.length}`);
+}
+function transient(error:unknown):boolean {
+  return error instanceof EngineError && Boolean(error.retryable) && Boolean(error.diagnostic&&["timeout","total_timeout","transport","body_read","http"].includes(error.diagnostic.kind));
+}
+function verification(list:any,target:Checkpoint):Result {
+  const matches=(item:any)=>String(item.signInstanceWid)===target.signInstanceWid;
+  if(list.signedTasks.some(matches))return {status:"success",message:"复查确认原提交任务已签到",submissionState:"signed"};
+  if([...list.unSignedTasks,...list.leaveTasks].some(matches))return {status:"error",message:"复查确认原任务仍未签到，可在后续执行中重试",retryable:true,retryAction:"execute",submissionState:"unsigned"};
+  return {status:"uncertain",message:"原提交任务未出现在已签或待签列表，尚不能确认；后续只复查，不重复提交",retryable:true,retryAction:"verify",submissionState:"unknown"};
 }
 export function selectTask(list: any, account: Account, mode: Mode): any {
   if(mode === "range")return list.unSignedTasks?.[0] ?? list.leaveTasks?.[0] ?? list.signedTasks?.[0] ?? list.registerLeaveTasks?.[0];
@@ -96,24 +119,33 @@ async function runExecution(account: Account, deviceId: string, mode: Mode, opti
     if(mode === "login")return {status:"success",message:"登录成功",data:{host:auth.host,cookies:auth.session.jar.names()}};
     const api = paths(account.type);
     trace.push("步骤 2/5 查询任务与表单");
+    auth.session.at?.("task_list");
     const list = await tasks(auth, api.list, mode !== "range");
+    listEvidence(list,account,trace,options.timezone);
     if (options.checkpoint) {
-      const signed = list.signedTasks.some((t: any) => String(t.signInstanceWid) === options.checkpoint!.signInstanceWid);
-      if(signed)return { status: "success", message: "中断恢复后复查确认已签到" };
-      if(list.unSignedTasks.some((t:any)=>String(t.signInstanceWid)===options.checkpoint!.signInstanceWid))
-        return {status:"error",message:"中断恢复后复查确认任务仍未签到",retryable:true};
-      return { status: "uncertain", message: "上次任务不在已签/未签列表，无法确认；已阻止再次提交，请在官方应用核实" };
+      trace.push("本次仅核对上次提交的原任务，不再次提交");
+      return verification(list,options.checkpoint);
     }
-    const task = selectTask(list,account,mode);
+    let task=selectTask(list,account,mode);
+    if(options.target){
+      const matches=(item:any)=>String(item.signInstanceWid)===options.target!.signInstanceWid;
+      if(list.signedTasks.some(matches))return {status:"already",message:"查询确认原目标任务已签到",submissionState:"signed"};
+      task=[...list.unSignedTasks,...list.leaveTasks].find(matches);
+      if(!task)return {status:"error",message:"原目标任务已不在当前列表，可能窗口变化；未确认已签，不计为成功",retryable:true,retryAction:"execute"};
+    }
     if(!task && mode==="range")return {status:"fail",message:"当天没有查到签到任务（未签到/已签到列表均为空）"};
-    if (!task) return list.signedTasks.length ? { status: "already", message: "今日任务已签到，无需重复执行" } :
-      { status: "no_task", message: "当前暂时没有未签到的任务哦！" };
+    if (!task) return list.signedTasks.length ? { status: "already", message: "当前列表只有已签任务，没有待签项；不代表未返回的任务已签到" } :
+      { status: "no_task", message: "当前未查到待签任务（不是签到成功）；请核对官方任务窗口与签到类型" };
+    const target={signInstanceWid:String(task.signInstanceWid),signWid:String(task.signWid)};
+    if(mode==="submit")await options.onTarget?.(target);
+    auth.session.at?.("task_detail");
     const detail = await auth.session.json(auth.host + api.detail, { signInstanceWid: task.signInstanceWid, signWid: task.signWid });
-    if (!detail.datas) throw new EngineError("没有获取到任务详情");
+    if (rejected(detail)||!detail.datas||String(detail.datas.signInstanceWid)!==target.signInstanceWid) throw new EngineError("任务详情异常或与目标不一致，未提交签到","error",true);
     if (mode === "range") return rangeResult(detail.datas,task.signWid);
     const form = buildForm(account, detail.datas);
     trace.push("任务与附加表单检查通过；无需照片");
     trace.push("步骤 3/5 动态密钥协商");
+    auth.session.at?.("secret");
     const key = await fetchSecret(auth.session, auth.tenantId, deviceId);
     trace.push("步骤 4/5 构造 iOS first_v4 加密请求（不记录密钥或密文）");
     const encrypted = signedBody(form, key);
@@ -127,35 +159,50 @@ async function runExecution(account: Account, deviceId: string, mode: Mode, opti
       const cookie = ["clientType=cpdaily_student", `sessionToken=${auth.sessionToken}`, "standAlone=0", `tenantId=${auth.tenantId}`];
       const mod = auth.session.jar.get("MOD_AUTH_CAS", auth.host);
       if (mod) cookie.push(`MOD_AUTH_CAS=${mod}`);
+      auth.session.at?.("submit");
       const result = await auth.session.json(auth.host + api.submit, {
         lon: account.lon, lat: account.lat, version: "first_v4", calVersion: "firstv", deviceId, userId: account.username,
         systemName: "iOS", systemVersion: "18.2", model: "iPhone 16 Pro", appVersion: "9.9.22", ...encrypted
       }, { "User-Agent":IOS_UA, deviceType: "2", CpdailyClientType: "CPDAILY", Accept: "*/*", CacheTimeValue: "0", sessionTokenKey: auth.sessionToken,
         "Accept-Language": "zh-Hans-CN", tenantId: auth.tenantId, CpdailyStandAlone: "0", Cookie: cookie.join("; ") },{timeoutMs:20000,ascii:false});
-      const message = String(result.message ?? "").slice(0, 200);
-      if (message === "SUCCESS") return { status: "success", message: "签到成功" };
-      if (/已签|重复/.test(message)) return { status: "already", message: "上游确认已签到" };
-      return { status: "fail", message: message || "上游拒绝提交（未提供原因）" };
-    } catch {
+      const message = String(result?.message ?? "").slice(0, 200);
+      if (message === "SUCCESS"&&!rejected(result)) return { status: "success", message: "签到成功",submissionState:"signed" };
+      // 失败或“重复/处理中”文本均不足以解除检查点，先核对同一任务。
+      if(message){
+        trace.push("提交未明确成功，核对原任务状态，不凭文本判成功或解除提交保护");
+        auth.session.at?.("confirmation");
+        const current=await tasks(auth,api.list);listEvidence(current,account,trace,options.timezone);
+        const checked=verification(current,checkpoint);
+        if(checked.submissionState==="unsigned")return {status:"fail",message,submissionState:"unsigned"};
+        return checked;
+      }
+      throw new EngineError("提交响应缺少结果，需核对原任务","error",true);
+    } catch (error) {
+      const diagnostic=error instanceof EngineError?error.diagnostic:undefined;
+      if(diagnostic?.httpStatus===418||diagnostic?.httpStatus===429)return {status:"uncertain",message:"提交期间上游限制访问，已停止自动请求；请人工核实原任务",retryable:false,retryAction:"verify",submissionState:"unknown",diagnostic};
       trace.push("提交响应异常，等待后复查任务状态");
       await new Promise(resolve=>setTimeout(resolve,options.confirmDelayMs ?? 3000));
       try {
-        const current = await tasks(auth, api.list);
-        if (current.signedTasks.some((t: any) => String(t.signInstanceWid) === checkpoint.signInstanceWid))
-          return { status: "success", message: "提交响应异常，但复查确认已签到" };
-        if (current.unSignedTasks.some((t:any)=>String(t.signInstanceWid)===checkpoint.signInstanceWid))
-          return {status:"error",message:"提交请求异常，复查确认任务仍未签到",retryable:true};
-      } catch {}
-      return { status: "uncertain", message: "提交响应异常且未确认状态；不自动重试，请在官方应用核实" };
+        auth.session.at?.("confirmation");
+        const current = await tasks(auth, api.list);listEvidence(current,account,trace,options.timezone);
+        return {...verification(current,checkpoint),transientFailure:transient(error),diagnostic};
+      } catch (confirmationError) {
+        const retryable=!(confirmationError instanceof EngineError)||confirmationError.retryable;
+        return { status: "uncertain", message: "提交状态仍未确认；后续只复查原任务，不盲目重复提交",retryable,retryAction:"verify",submissionState:"unknown",
+          transientFailure:transient(error)||transient(confirmationError),diagnostic:confirmationError instanceof EngineError?confirmationError.diagnostic:diagnostic };
+      }
     }
   } catch (e) {
-    if (submitted) return { status: "uncertain", message: "中断任务的提交状态无法确认，请人工核实，不自动重新提交" };
-    if (e instanceof EngineError) return { status: e.status, message: e.message, retryable: e.retryable };
+    const diagnostic=e instanceof EngineError?e.diagnostic:undefined;
+    if (submitted) return { status: "uncertain", message: "未能确认上次提交状态；保留原任务检查点，后续只复查",retryable:e instanceof EngineError&&e.retryable,retryAction:"verify",submissionState:"unknown",transientFailure:transient(e),diagnostic };
+    if (e instanceof EngineError) return { status: e.status, message: e.message, retryable: e.retryable,retryAction:e.retryable?"execute":undefined,transientFailure:transient(e),diagnostic };
     return { status: "error", message: "执行失败，请检查配置或协议兼容性", retryable: false };
   }
 }
 export async function execute(account: Account, deviceId: string, mode: Mode, options: ExecutionOptions = {}): Promise<Result> {
   const trace: string[] = [];
   const result = await runExecution(account,deviceId,mode,options,trace);
-  return {...result,detail:[...trace,result.message].join("\n")};
+  const diagnostic=safeDiagnostic(result.diagnostic,[account.password,account.username,account.displayName??"",account.notifyOption?.rcvOption??account.notifyKey]);
+  if(diagnostic)trace.push(`上游诊断：${JSON.stringify(diagnostic)}`);
+  return {...result,diagnostic:diagnostic??undefined,detail:[...trace,result.message].join("\n")};
 }

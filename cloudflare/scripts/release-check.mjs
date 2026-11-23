@@ -10,7 +10,7 @@ const files=working?[...new Set([...git("diff","HEAD","--name-only","--diff-filt
 if(!files.length){console.error("No changed files to check.");process.exit(1);}
 const contents=file=>working?readFileSync(join(root,file),"utf8"):git("show",":"+file);
 const allowed=path=>[".gitignore","LICENSE","README.md","THIRD_PARTY_NOTICES.md","docs/FLOW_REVIEW.md"].includes(path)||
- /^cloudflare\/(src\/.*\.ts|tests\/(?:.*\.test\.ts|helpers\.ts|fixtures\/original-(?:rules|http)\.json)|migrations\/\d+_[a-z_]+\.sql|scripts\/[^/]+\.(?:mjs|py)|public\/(?:index\.html|admin\.html|app\.js|enroll\.js|redemption\.css|style\.css|school_list\.js|_headers)|(?:README|MIGRATION-PARITY)\.md|(?:package|package-lock)\.json|wrangler\.jsonc|tsconfig\.json|vitest\.config\.ts|\.dev\.vars\.example)$/.test(path)||
+ /^cloudflare\/(src\/.*\.ts|tests\/(?:.*\.test\.ts|helpers\.ts|fixtures\/original-(?:rules|http|scheduler)\.json)|migrations\/\d+_[a-z_]+\.sql|scripts\/[^/]+\.(?:mjs|py)|public\/(?:index\.html|admin\.html|app\.js|enroll\.js|redemption\.css|style\.css|school_list\.js|_headers)|(?:README|MIGRATION-PARITY)\.md|(?:package|package-lock)\.json|wrangler\.jsonc|tsconfig\.json|vitest\.config\.ts|\.dev\.vars\.example)$/.test(path)||
  /^jrxy-engine\/(actions\/[^/]+\.py|scripts\/[^/]+\.py|README\.md|LICENSE|requirements\.txt|config\.example\.yml|\.gitignore)$/.test(path)||
  /^web-server\/(app\.py|requirements\.txt)$/.test(path);
 const issues=[];

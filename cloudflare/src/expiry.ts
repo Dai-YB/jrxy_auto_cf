@@ -11,7 +11,7 @@ export async function purgeGrantedAccount(env: Env, name: string): Promise<void>
     env.DB.prepare(`UPDATE batches SET summary=NULL,detail=NULL,privacy_version=privacy_version+1 WHERE id IN (SELECT batch_id FROM jobs WHERE account=?) AND ${eligible}`).bind(name,name),
     env.DB.prepare(`DELETE FROM enrollment_attempts WHERE account_name=? AND ${eligible}`).bind(name,name),
     env.DB.prepare(`DELETE FROM account_locks WHERE account=? AND ${eligible}`).bind(name,name),
-    env.DB.prepare(`UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0 WHERE kind='job' AND owner IS NULL
+    env.DB.prepare(`UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0,delivery_token=NULL WHERE kind='job' AND owner IS NULL
       AND task_id IN(SELECT id FROM jobs WHERE account=?) AND ${eligible}`).bind(name,name),
     env.DB.prepare(`DELETE FROM jobs WHERE account=? AND ${eligible}`).bind(name,name),
     env.DB.prepare("DELETE FROM accounts WHERE name=? AND grant_code_id IS NOT NULL").bind(name),

@@ -90,6 +90,16 @@ describe("bounded persistent execution slots",()=>{
     await processJob(e,ids[2],async()=>ok());await dispatch(e);const {dispatchEnrollments}=await import("../src/redemption");await dispatchEnrollments(e);
     console.log("D1 statements for task + follow-up:",queries);expect(queries).toBeLessThanOrEqual(50);
   });
+  it("keeps submit checkpoints, token ownership and three follow-up deliveries within the query budget",async()=>{
+    const names=await users(6);await updateExecution(e,{parallelism:3});const ids=await enqueue(e,names,"submit");
+    await processJob(e,ids[0],async()=>({status:"success",message:"ok"}));await processJob(e,ids[1],async()=>({status:"success",message:"ok"}));await dispatch(e);
+    const body=(e.JOBS.send as any).mock.calls.find((call:any)=>call[0].id===ids[2])[0],raw=e.DB;let queries=0;
+    function wrap(statement:any):any{return{raw:statement,bind:(...values:any[])=>wrap(statement.bind(...values)),first:async(...args:any[])=>{queries++;return statement.first(...args);},all:async(...args:any[])=>{queries++;return statement.all(...args);},run:async(...args:any[])=>{queries++;return statement.run(...args);}};}
+    const measured={...e,DB:{prepare:(sql:string)=>wrap(raw.prepare(sql)),batch:async(statements:any[])=>{queries+=statements.length;return raw.batch(statements.map(statement=>statement.raw));}} as any};
+    await processJob(measured,ids[2],async(_a,_d,_m,options)=>{const checkpoint={signInstanceWid:"t",signWid:"s"};await options!.onTarget!(checkpoint);await options!.beforeSubmit!(checkpoint);return{status:"success",message:"ok",submissionState:"signed"};},body.deliveryToken);
+    await dispatch(measured);const {dispatchEnrollments}=await import("../src/redemption");await dispatchEnrollments(measured);
+    console.log("D1 statements for submit + three follow-ups:",queries);expect(queries).toBeLessThanOrEqual(50);
+  });
   it("does not advance a retry round until all concurrent reports complete",async()=>{
     const names=await users(3);await updateExecution(e,{parallelism:2});const ids=await enqueue(e,names,"submit","定时");await e.DB.prepare("UPDATE jobs SET trigger='schedule',max_attempts=2").run();await e.DB.prepare("UPDATE batches SET trigger='schedule'").run();
     const fail=vi.fn().mockResolvedValue({status:"error",message:"synthetic",retryable:true});

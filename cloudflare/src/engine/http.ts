@@ -61,7 +61,7 @@ export function responseCookies(headers: Headers): string[] {
   if(!headers.has("Set-Cookie"))return [];
   throw new Error("Runtime does not support separate Set-Cookie values");
 }
-async function beforeDeadline<T>(deadline: number, work: () => Promise<T>, expired: () => EngineError): Promise<T> {
+export async function beforeDeadline<T>(deadline: number, work: () => Promise<T>, expired: () => Error): Promise<T> {
   const left = deadline - Date.now();
   if (left <= 0) throw expired();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -72,7 +72,7 @@ async function beforeDeadline<T>(deadline: number, work: () => Promise<T>, expir
     return value;
   } finally { if (timer !== undefined) clearTimeout(timer); }
 }
-function discardBody(response?: Response, reader?: ReadableStreamDefaultReader<Uint8Array>): void {
+export function discardBody(response?: Response, reader?: ReadableStreamDefaultReader<Uint8Array>): void {
   // 取消是尽力清理；异常上游不能通过卡住cancel()拖过总时限。
   try { void (reader ? reader.cancel() : response?.body?.cancel())?.catch(() => {}); } catch {}
 }

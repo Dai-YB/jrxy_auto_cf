@@ -96,6 +96,7 @@ export async function fetchSecret(session: Session, tenant: string, deviceId: st
     deviceType: "1", SessionTokenKey: token, SessionToken: token, wisDeviceId: deviceId,
     CpdailyInfo: des(JSON.stringify({ deviceId, systemName: "android", appVersion: "9.9.22", model: "23127PN0CC",
       lon: 0, lat: 0, cpdailyVersion: "9.9.22", systemVersion: "14", userId: "" })) };
+  let lastFailure: EngineError | undefined;
   for (const host of ["https://data-xxt.aichaoxing.com/", "https://mobile.campushoy.com/"]) {
     try {
       let response = await session.json(host + "app/auth/dynamic/secret/getSecretKey/v-920", data, headers, {timeoutMs:20000});
@@ -112,10 +113,13 @@ export async function fetchSecret(session: Session, tenant: string, deviceId: st
       if (Buffer.byteLength(key) === 16) return key;
     } catch (e) {
       // 原引擎在候选主机不可用/响应不兼容时尝试下一主机；限流响应则停止。
-      if (e instanceof EngineError && e.message.includes("上游限制访问")) throw e;
+      if (e instanceof EngineError) {
+        if (e.message.includes("上游限制访问")) throw e;
+        if(e.retryable)lastFailure=e;
+      }
     }
   }
-  throw new EngineError("动态密钥协商失败", "error", true);
+  throw new EngineError("动态密钥协商失败", "error", true,lastFailure?.diagnostic);
 }
 export function randomLoginPrefix(): string {
   const alphabet = "ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678";

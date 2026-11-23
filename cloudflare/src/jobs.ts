@@ -2,18 +2,24 @@ import { execute, type Checkpoint } from "./engine/sign";
 import { getAccount } from "./storage";
 import { classify, notification, notifyHead, notifyOption, sendNotify } from "./notify";
 import { redact, requireConfigured, seal } from "./security";
-import { settings } from "./config";
+import { localTime, settings } from "./config";
 import { accountValid } from "./identity";
 import { purgeGrantedAccount } from "./expiry";
 import { AppError, EngineError, type Batch, type Env, type Job, type Mode, type Result } from "./types";
 import { expireSlots, ownsSlotSql, releaseSlot, reserveSlot, slotClaim, slotGate, syncGate } from "./execution";
 
 const earlierWave=(left:string,right:string)=>`(${left}.priority>${right}.priority OR (${left}.priority=${right}.priority AND ${left}.wave_no<${right}.wave_no))`;
+const reportLease=(alias:string,now=Date.now())=>`${alias}.lease_until>${Math.trunc(now)} AND EXISTS(SELECT 1 FROM execution_slots s WHERE s.kind='job' AND s.task_id=${alias}.id AND s.owner=${alias}.owner AND s.lease_until>${Math.trunc(now)})`;
 
 export async function enqueue(env: Env, names: string[], mode: Mode, triggerLabel = "手动"): Promise<string[]> {
   requireConfigured(env);
   if (!names.length) return [];
-  if(names.length===1)await getAccount(env,names[0]);
+  if(names.length===1){
+    await getAccount(env,names[0]);
+    const existing=await env.DB.prepare("SELECT id,mode FROM jobs WHERE account=? AND (status!='done' OR report_pending=1) ORDER BY created_at,sequence_no LIMIT 1")
+      .bind(names[0]).first<{id:string;mode:Mode}>();
+    if(existing){if(existing.mode===mode&&mode==="submit")return [existing.id];throw new AppError("该账号已有待执行任务，请查看任务状态，不能重复执行",409);}
+  }
   if(mode==="submit" && names.length===1) {
     const account=await env.DB.prepare("SELECT paused FROM accounts WHERE name=? AND deleted=0").bind(names[0]).first<{paused:number}>();
     if(account?.paused)throw new AppError("账号已暂停，请恢复后再签到",409);
@@ -24,12 +30,14 @@ export async function enqueue(env: Env, names: string[], mode: Mode, triggerLabe
   const rows = await env.DB.batch<{id: string}>([
     env.DB.prepare("INSERT INTO batches(id,trigger,mode,label,created_at,round_due,concurrency_limit) SELECT ?,'manual',?,?,?,?,parallelism FROM execution_settings WHERE id=1")
       .bind(batchId,mode,triggerLabel,now,now),
-    env.DB.prepare(`INSERT INTO jobs(id,account,mode,trigger,next_at,created_at,trigger_label,batch_id,sequence_no,account_version,priority,wave_no)
+    env.DB.prepare(`INSERT INTO jobs(id,account,mode,trigger,next_at,created_at,trigger_label,batch_id,sequence_no,account_version,priority,wave_no,checkpoint,target)
       SELECT ? || ':' || a.name,a.name,?,'manual',?,?,?,?,ROW_NUMBER() OVER(ORDER BY a.priority DESC,CAST(n.key AS INTEGER))-1,a.pause_version,a.priority,
-        CAST((ROW_NUMBER() OVER(PARTITION BY a.priority ORDER BY CAST(n.key AS INTEGER))-1)/(SELECT concurrency_limit FROM batches WHERE id=?) AS INTEGER)
+        CAST((ROW_NUMBER() OVER(PARTITION BY a.priority ORDER BY CAST(n.key AS INTEGER))-1)/(SELECT concurrency_limit FROM batches WHERE id=?) AS INTEGER),
+        CASE WHEN ?='submit' THEN a.submission_checkpoint END,
+        CASE WHEN ?='submit' THEN a.submission_checkpoint END
       FROM json_each(?) n JOIN accounts a ON a.name=n.value WHERE a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?) AND (?!='submit' OR a.paused=0) AND NOT EXISTS
       (SELECT 1 FROM jobs WHERE account=a.name AND (status!='done' OR report_pending=1)) RETURNING id`)
-      .bind(batchId,mode,now,now,triggerLabel,batchId,batchId,JSON.stringify(names),now,mode)
+      .bind(batchId,mode,now,now,triggerLabel,batchId,batchId,mode,mode,JSON.stringify(names),now,mode)
   ]);
   const ids = rows.slice(1).flatMap(row => row.results.map(value => String(value.id)));
   if (!ids.length) {
@@ -44,7 +52,11 @@ export async function advanceBatch(env: Env, id: string, now = Date.now()): Prom
   if (!batch) return;
   const jobs = (await env.DB.prepare("SELECT * FROM jobs WHERE batch_id=? ORDER BY sequence_no").bind(id).all<Job>()).results;
   if (jobs.some(j => j.report_pending || j.status === "running")) return;
-  if (jobs.length && jobs.every(j => j.status === "done")) {
+  if (!jobs.length) {
+    await env.DB.prepare("UPDATE batches SET finished_at=?,summary='没有可用账号',detail='' WHERE id=? AND finished_at IS NULL AND NOT EXISTS(SELECT 1 FROM jobs WHERE batch_id=?)").bind(now,id,id).run();
+    return;
+  }
+  if (jobs.every(j => j.status === "done")) {
     const counts: Record<string, number> = {};
     const lines = jobs.map(job => {
       const result = job.result ? classify(JSON.parse(job.result)) : "执行异常";
@@ -70,21 +82,27 @@ export async function advanceBatch(env: Env, id: string, now = Date.now()): Prom
   const pending = jobs.filter(j => j.status === "pending");
   if (!pending.length || pending.some(j => j.attempts < batch.round)) return;
   // 整轮结束后才开始重试等待，不让失败账号抢在本轮剩余账号之前重试。
-  const nextRound = Math.min(...pending.map(j => j.attempts + 1));
+  const nextRound = batch.round+1;
   const due = Math.max(now + settings(env).retryMs, ...pending.map(j => j.next_at));
+  const fallback=batch.concurrency_limit>1&&pending.some(job=>{
+    try{return Boolean(job.result&&JSON.parse(job.result).transientFailure);}catch{return false;}
+  });
+  const ready="NOT EXISTS(SELECT 1 FROM jobs j WHERE j.batch_id=batches.id AND (j.report_pending=1 OR j.status='running' OR (j.status='pending' AND j.attempts<batches.round)))";
   await env.DB.batch([
-    env.DB.prepare(`UPDATE jobs SET next_at=max(next_at,?),dispatched_at=0 WHERE batch_id=? AND status='pending'
-      AND EXISTS(SELECT 1 FROM batches WHERE id=? AND round=? AND finished_at IS NULL)`)
-      .bind(due, id, id, batch.round),
-    env.DB.prepare("UPDATE batches SET round=?,round_due=? WHERE id=? AND round=? AND finished_at IS NULL")
-      .bind(nextRound, due, id, batch.round)
+    env.DB.prepare(`UPDATE jobs SET next_at=max(next_at,?),dispatched_at=0,wave_no=CASE WHEN ? THEN sequence_no ELSE wave_no END
+      WHERE batch_id=? AND status='pending' AND EXISTS(SELECT 1 FROM batches WHERE id=? AND round=? AND finished_at IS NULL AND ${ready})`)
+      .bind(due,fallback?1:0,id,id,batch.round),
+    env.DB.prepare(`UPDATE batches SET round=?,round_due=?,concurrency_limit=CASE WHEN ? THEN 1 ELSE concurrency_limit END,
+      fallback_reason=CASE WHEN ? THEN '上游请求异常，后续重试轮使用串行' ELSE fallback_reason END
+      WHERE id=? AND round=? AND finished_at IS NULL AND ${ready}`)
+      .bind(nextRound,due,fallback?1:0,fallback?1:0,id,batch.round)
   ]);
 }
 
 export async function dispatch(env: Env, limit=3): Promise<void> {
   requireConfigured(env);
   const now = Date.now();
-  await env.DB.prepare(`UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0 WHERE owner IS NULL AND
+  await env.DB.prepare(`UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0,delivery_token=NULL WHERE owner IS NULL AND
     ((kind='job' AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.id=task_id AND (j.status='pending' OR j.report_pending=1))) OR
      (kind='enrollment' AND NOT EXISTS(SELECT 1 FROM enrollment_attempts e WHERE e.id=task_id AND e.status='pending' AND e.expires_at>?)))`).bind(now).run();
   await syncGate(env);
@@ -104,17 +122,18 @@ export async function dispatch(env: Env, limit=3): Promise<void> {
           AND ${earlierWave("p","j")} AND (p.status='running' OR p.report_pending=1 OR (p.status!='done' AND p.attempts<b.round)))))
     ORDER BY j.report_pending DESC,b.created_at,j.sequence_no LIMIT ?`).bind(now-120000,now,now,now,now+60000,now+60000,Math.max(1,Math.min(3,limit))).all<Job & {round_due:number}>();
   for(const job of candidates.results){
-    const due=job.report_pending?now:Math.max(now,job.next_at,job.round_due);
-    if(!await reserveSlot(env,"job",job.id,now,due))continue;
+    const due=job.report_pending?now:Math.max(now,job.next_at,job.round_due),deliveryToken=crypto.randomUUID();
+    if(!await reserveSlot(env,"job",job.id,now,due,deliveryToken))continue;
     const claimed=await env.DB.prepare(`UPDATE jobs SET dispatched_at=? WHERE id=? AND dispatched_at<? AND (status='pending' OR report_pending=1) RETURNING id`)
       .bind(due,job.id,now-120000).first();
-    if(!claimed){await releaseSlot(env,"job",job.id,null);continue;}
+    if(!claimed){await releaseSlot(env,"job",job.id,null,deliveryToken);continue;}
     try{
       const delaySeconds=Math.ceil((due-now)/1000);
-      if(delaySeconds)await env.JOBS.send({id:job.id},{delaySeconds});else await env.JOBS.send({id:job.id});
+      if(delaySeconds)await env.JOBS.send({id:job.id,deliveryToken},{delaySeconds});else await env.JOBS.send({id:job.id,deliveryToken});
     }catch{
-      await env.DB.prepare("UPDATE jobs SET dispatched_at=0 WHERE id=? AND dispatched_at=?").bind(job.id,due).run();
-      await releaseSlot(env,"job",job.id,null);
+      await env.DB.prepare(`UPDATE jobs SET dispatched_at=0 WHERE id=? AND dispatched_at=? AND EXISTS
+        (SELECT 1 FROM execution_slots WHERE kind='job' AND task_id=jobs.id AND owner IS NULL AND delivery_token=?)`).bind(job.id,due,deliveryToken).run();
+      await releaseSlot(env,"job",job.id,null,deliveryToken);
     }
   }
 }
@@ -128,9 +147,9 @@ async function finishReport(env: Env, job: Job, owner: string): Promise<void> {
   if(retry && job.mode==="submit") {
     const state=await env.DB.prepare("SELECT paused,pause_version FROM accounts WHERE name=? AND deleted=0").bind(job.account).first<{paused:number;pause_version:number}>();
     if(!state || state.paused || state.pause_version!==job.account_version) {
-      result={status:"paused",message:"账号已暂停或恢复过，旧重试任务已取消"};
+      result={...result,status:"paused",retryable:false,message:"账号已暂停或恢复过，旧重试任务已取消"};
       const saved=await env.DB.prepare(`UPDATE jobs SET status='done',result=?,finished_at=?,notification_result=NULL
-        WHERE id=? AND owner=? AND report_pending=1 AND status='pending' RETURNING id`)
+        WHERE id=? AND owner=? AND report_pending=1 AND status='pending' AND ${reportLease("jobs")} RETURNING id`)
         .bind(JSON.stringify(result),Date.now(),job.id,owner).first();
       if(!saved)return;
       retry=false;job.notification_result=null;
@@ -142,10 +161,10 @@ async function finishReport(env: Env, job: Job, owner: string): Promise<void> {
   if (!job.notification_result) {
     if (result.status === "paused") push = "推送跳过（账号暂停，不发送签到失败通知）";
     else if (job.mode === "dry" && env.NOTIFY_ON_DRY !== "1") push = "推送跳过（探测默认不推送，可设 NOTIFY_ON_DRY=1）";
-    else if (retry) push = `推送跳过（执行异常，${settings(env).retryMs / 60_000} 分钟后重试）`;
+    else if (retry) push = `推送跳过（${result.retryAction==="verify"?"提交待确认，下一轮仅复查":"本轮执行异常"}；整轮结束后等待${settings(env).retryMs / 60_000}分钟，剩余${Math.max(0,job.max_attempts-job.attempts)}次）`;
     else if (job.mode === "dry" || job.mode === "submit") {
       const notifyClaim = await env.DB.prepare(`UPDATE jobs SET notified=1 WHERE id=? AND owner=? AND notified=0
-        AND report_pending=1 AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?)) RETURNING id`).bind(job.id, owner,Date.now()).first();
+        AND report_pending=1 AND ${reportLease("jobs")} AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?)) RETURNING id`).bind(job.id, owner,Date.now()).first();
       if (notifyClaim) {
         try {
           const { account } = await getAccount(env, job.account);
@@ -158,7 +177,7 @@ async function finishReport(env: Env, job: Job, owner: string): Promise<void> {
         push = "推送状态未知：上次发送期间中断，为避免重复推送未再次发送";
       }
     }
-    await env.DB.prepare("UPDATE jobs SET notification_result=? WHERE id=? AND owner=? AND report_pending=1")
+    await env.DB.prepare(`UPDATE jobs SET notification_result=? WHERE id=? AND owner=? AND report_pending=1 AND ${reportLease("jobs")}`)
       .bind(push, job.id, owner).run();
   }
   const now = Date.now();
@@ -166,41 +185,61 @@ async function finishReport(env: Env, job: Job, owner: string): Promise<void> {
     : job.mode === "range" ? (result.status === "success" ? "签到范围已获取并应用" : "范围获取失败") : classify(result);
   await env.DB.batch([
     env.DB.prepare(`INSERT INTO sign_log(ts,account,kind,result,detail,batch_id) SELECT ?,account,?,?,?,batch_id FROM jobs
-      WHERE id=? AND owner=? AND report_pending=1 AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?))`)
-      .bind(now, `${trigger}${action}[${job.account}]`, label, ((result.detail || result.message) + (push ? `\n\n[${push}]` : "")).slice(-4000), job.id, owner,now),
+      WHERE id=? AND owner=? AND report_pending=1 AND lease_until>? AND ${ownsSlotSql("job")}
+      AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?))`)
+      .bind(now,`${trigger}${action}[${job.account}]`,label,((result.detail||result.message)+`\n\n本账号已执行${job.attempts}次，最多${job.max_attempts}次；${retry?"整轮结束后进入下一轮":"本次任务已结束（不等同签到成功）"}`+(push?`\n[${push}]`:"")).slice(-4000),job.id,owner,now,job.id,owner,now,now),
     env.DB.prepare(`UPDATE batches SET last_finished_at=? WHERE id=? AND EXISTS
-      (SELECT 1 FROM jobs WHERE id=? AND owner=? AND report_pending=1)`).bind(now, job.batch_id, job.id, owner),
+      (SELECT 1 FROM jobs WHERE id=? AND owner=? AND report_pending=1 AND ${reportLease("jobs",now)})`).bind(now, job.batch_id, job.id, owner),
     env.DB.prepare(`UPDATE jobs SET next_at=max(next_at,?),dispatched_at=0 WHERE batch_id=? AND status='pending'
-      AND EXISTS(SELECT 1 FROM jobs p WHERE p.id=? AND p.owner=? AND p.report_pending=1 AND ${earlierWave("p","jobs")})`)
+      AND EXISTS(SELECT 1 FROM jobs p WHERE p.id=? AND p.owner=? AND p.report_pending=1 AND ${reportLease("p",now)} AND ${earlierWave("p","jobs")})`)
       .bind(now + settings(env).intervalMs, job.batch_id, job.id, owner),
-    env.DB.prepare("UPDATE jobs SET report_pending=0,owner=NULL,lease_until=0,dispatched_at=0 WHERE id=? AND owner=? AND report_pending=1")
+    env.DB.prepare(`UPDATE jobs SET report_pending=0,owner=NULL,lease_until=0,dispatched_at=0 WHERE id=? AND owner=? AND report_pending=1 AND ${reportLease("jobs",now)}`)
       .bind(job.id, owner)
   ]);
   await advanceBatch(env, job.batch_id!, now);
 }
 
-export async function processJob(env: Env, id: string, run = execute): Promise<void> {
+export async function processJob(env: Env, id: string, run = execute, deliveryToken:string|null=null): Promise<{retryAfter:number}|void> {
   requireConfigured(env);
   const now = Date.now();
   const owner = crypto.randomUUID();
   const cfg = settings(env);
   const lease = now + cfg.runTimeoutMs + 60_000;
   const job = await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(id).first<Job>();
-  if (!job || (job.status === "done" && !job.report_pending)) {await releaseSlot(env,"job",id,null);return;}
+  if(deliveryToken){
+    const reservation=await env.DB.prepare("SELECT owner,lease_until FROM execution_slots WHERE kind='job' AND task_id=? AND delivery_token=?").bind(id,deliveryToken).first<{owner:string|null;lease_until:number}>();
+    if(!reservation)return;
+    if(reservation.owner&&reservation.lease_until>now)return;
+  }
+  if (!job || (job.status === "done" && !job.report_pending)) {if(deliveryToken)await releaseSlot(env,"job",id,null,deliveryToken);return;}
   if(job.lease_until>now)return;
   const eligibility=await env.DB.prepare("SELECT deleted,authorization_until FROM accounts WHERE name=?").bind(job.account).first<{deleted:number;authorization_until:number|null}>();
-  if(!eligibility||!accountValid(eligibility,now)){await purgeGrantedAccount(env,job.account);await releaseSlot(env,"job",id,null);return;}
+  if(!eligibility||!accountValid(eligibility,now)){await purgeGrantedAccount(env,job.account);if(deliveryToken)await releaseSlot(env,"job",id,null,deliveryToken);return;}
   const batch = await env.DB.prepare("SELECT * FROM batches WHERE id=?").bind(job.batch_id).first<Batch>();
-  if (!batch || batch.finished_at) {await releaseSlot(env,"job",id,null);return;}
-  if (!job.report_pending && (job.status !== "pending" || job.next_at > now || batch.round_due > now || job.attempts >= batch.round)) return;
+  if (!batch || batch.finished_at) {if(deliveryToken)await releaseSlot(env,"job",id,null,deliveryToken);return;}
+  if (!job.report_pending && (job.status !== "pending" || job.attempts >= batch.round)) {
+    if(deliveryToken)await releaseSlot(env,"job",id,null,deliveryToken);return;
+  }
+  if(!job.report_pending&&Math.max(job.next_at,batch.round_due)>now){
+    const due=Math.max(job.next_at,batch.round_due);
+    if(deliveryToken){
+      await env.DB.prepare("UPDATE execution_slots SET lease_until=max(lease_until,?) WHERE kind='job' AND task_id=? AND owner IS NULL AND delivery_token=?")
+        .bind(due+120000,id,deliveryToken).run();
+      await syncGate(env);
+      return {retryAfter:Math.max(1,Math.min(43200,Math.ceil((due-now)/1000)))};
+    }
+    return;
+  }
   const claimed = await env.DB.batch([
-    expireSlots(env,now),slotGate(env,now,lease),slotClaim(env,"job",id,owner,now,lease),
+    expireSlots(env,now),slotGate(env,now,lease),slotClaim(env,"job",id,owner,now,lease,deliveryToken),
     env.DB.prepare(`INSERT INTO account_locks(account,job_id,owner,lease_until)
       SELECT ?,?,?,? WHERE ${ownsSlotSql("job")}
       ON CONFLICT(account) DO UPDATE SET job_id=excluded.job_id,owner=excluded.owner,lease_until=excluded.lease_until
       WHERE account_locks.lease_until<=?`).bind(job.account,id,owner,lease,id,owner,now,now),
     env.DB.prepare(`UPDATE jobs SET status=CASE WHEN report_pending=1 THEN status ELSE 'running' END,owner=?,lease_until=?,
       attempts=attempts+CASE WHEN report_pending=1 THEN 0 ELSE 1 END,
+      checkpoint=CASE WHEN mode='submit' AND report_pending=0 THEN coalesce((SELECT submission_checkpoint FROM accounts WHERE name=jobs.account),checkpoint) ELSE checkpoint END,
+      target=CASE WHEN mode='submit' AND report_pending=0 THEN coalesce((SELECT submission_checkpoint FROM accounts WHERE name=jobs.account),target) ELSE target END,
       attempt_started_at=CASE WHEN report_pending=1 THEN attempt_started_at ELSE ? END
       WHERE id=? AND lease_until<=? AND (report_pending=1 OR (status='pending' AND next_at<=? AND
         EXISTS(SELECT 1 FROM batches b WHERE b.id=jobs.batch_id AND b.finished_at IS NULL AND b.round_due<=? AND jobs.attempts<b.round
@@ -212,30 +251,45 @@ export async function processJob(env: Env, id: string, run = execute): Promise<v
   ]);
   const current = claimed[4].results[0] as unknown as Job | undefined;
   if (!current) {
+    if(deliveryToken)await env.DB.prepare(`UPDATE jobs SET dispatched_at=0 WHERE id=? AND lease_until<=? AND (status='pending' OR report_pending=1)
+      AND EXISTS(SELECT 1 FROM execution_slots WHERE kind='job' AND task_id=jobs.id AND (owner IS NULL OR owner=?) AND delivery_token=?)`).bind(id,now,owner,deliveryToken).run();
     await release(env, job.account, owner);
-    await releaseSlot(env,"job",id,null);
-    await env.DB.prepare("UPDATE jobs SET dispatched_at=0 WHERE id=? AND lease_until<=? AND (status='pending' OR report_pending=1)").bind(id,now).run();
+    if(deliveryToken)await releaseSlot(env,"job",id,null,deliveryToken);
     return;
   }
   try {
     if (!current.report_pending) {
       let result: Result;
-      let rangeConfig: string | null = null;
+      let rangeConfig: string | null = null,persistenceFailed=false;
+      const persist=async<T>(work:()=>Promise<T>):Promise<T>=>{
+        try{return await work();}catch{persistenceFailed=true;throw new AppError("任务持久化暂不可用，停止继续请求",503);}
+      };
       try {
-        const { row, account } = await getAccount(env, current.account);
+        const { row, account } = await getAccount(env, current.account).catch(error=>{if(!(error instanceof AppError))persistenceFailed=true;throw error;});
         const stopped = current.mode==="submit" && (row.paused || row.pause_version!==current.account_version);
         if (stopped && !current.checkpoint) result={status:"paused",message:"账号已暂停或暂停状态已变更，本次签到已跳过"};
         else if (current.recoveries > 2) result = { status: current.checkpoint ? "uncertain" : "error", message: "任务多次中断，已停止，请检查运行额度和网络" };
         else result = await run(account, row.device_id, current.mode, {
           checkpoint: current.checkpoint ? JSON.parse(current.checkpoint) as Checkpoint : undefined,
-          httpTimeoutMs: cfg.httpTimeoutMs, runTimeoutMs: cfg.runTimeoutMs,
+          target: current.target ? JSON.parse(current.target) as Checkpoint : undefined,
+          httpTimeoutMs: cfg.httpTimeoutMs, runTimeoutMs: cfg.runTimeoutMs,timezone:cfg.timezone,
+          onTarget:async target=>{
+            const saved=await persist(()=>env.DB.prepare(`UPDATE jobs SET target=? WHERE id=? AND owner=? AND status='running' AND lease_until>? AND ${ownsSlotSql("job")} RETURNING id`)
+              .bind(JSON.stringify(target),id,owner,Date.now(),id,owner,Date.now()).first());
+            if(!saved)throw new AppError("任务租约已失效，停止继续请求",409);
+          },
           beforeSubmit: async checkpoint => {
-            const saved = await env.DB.prepare(`UPDATE jobs SET checkpoint=? WHERE id=? AND owner=? AND status='running'
-              AND lease_until>? AND ${ownsSlotSql("job")}
-              AND EXISTS(SELECT 1 FROM account_locks l WHERE l.account=jobs.account AND l.owner=? AND l.lease_until>?)
-              AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND a.paused=0 AND a.pause_version=jobs.account_version AND (a.authorization_until IS NULL OR a.authorization_until>?)) RETURNING id`)
-              .bind(JSON.stringify(checkpoint),id,owner,Date.now(),id,owner,Date.now(),owner,Date.now(),Date.now()).first();
-            if (!saved) {
+            const checkedAt=Date.now(),serialized=JSON.stringify(checkpoint);
+            const saved=await persist(()=>env.DB.batch([
+              env.DB.prepare(`UPDATE jobs SET checkpoint=?,target=? WHERE id=? AND owner=? AND status='running'
+                AND lease_until>? AND ${ownsSlotSql("job")}
+                AND EXISTS(SELECT 1 FROM account_locks l WHERE l.account=jobs.account AND l.owner=? AND l.lease_until>?)
+                AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND a.paused=0 AND a.pause_version=jobs.account_version AND (a.authorization_until IS NULL OR a.authorization_until>?)) RETURNING id`)
+                .bind(serialized,serialized,id,owner,checkedAt,id,owner,checkedAt,owner,checkedAt,checkedAt),
+              env.DB.prepare(`UPDATE accounts SET submission_checkpoint=? WHERE name=? AND deleted=0 AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND owner=? AND status='running' AND checkpoint=? AND ${reportLease("jobs",checkedAt)}) RETURNING name`)
+                .bind(serialized,current.account,id,owner,serialized)
+            ]));
+            if (!saved[0].results.length||!saved[1].results.length) {
               const state=await env.DB.prepare("SELECT paused,pause_version,authorization_until FROM accounts WHERE name=?").bind(current.account).first<{paused:number;pause_version:number;authorization_until:number|null}>();
               if(!state || !accountValid(state))throw new EngineError("授权已到期，本次未提交签到","expired");
               if(state.paused || state.pause_version!==current.account_version)throw new EngineError("账号已暂停，本次未提交签到","paused");
@@ -257,23 +311,31 @@ export async function processJob(env: Env, id: string, run = execute): Promise<v
       } catch (e) {
         result = { status: "fail", message: e instanceof AppError ? e.message : "任务无法读取配置或执行，请检查账号与服务设置" };
       }
+      if(persistenceFailed)throw new Error("任务持久化暂不可用，保留检查点等待恢复");
       const stillValid=await env.DB.prepare("SELECT deleted,authorization_until FROM accounts WHERE name=?").bind(current.account).first<{deleted:number;authorization_until:number|null}>();
       if(!stillValid||!accountValid(stillValid)){await purgeGrantedAccount(env,current.account);return;}
       if(current.mode==="submit" && result.retryable) {
         const state=await env.DB.prepare("SELECT paused,pause_version FROM accounts WHERE name=? AND deleted=0").bind(current.account).first<{paused:number;pause_version:number}>();
-        if(!state || state.paused || state.pause_version!==current.account_version)result={status:"paused",message:"任务未完成，但账号已暂停或恢复过；不再重试旧任务"};
+        if(!state || state.paused || state.pause_version!==current.account_version)result={...result,status:"paused",retryable:false,message:"任务未完成，但账号已暂停或恢复过；不再重试旧任务"};
       }
-      const retry = result.retryable === true && current.trigger === "schedule" && current.attempts < current.max_attempts;
+      const retry = ["error","uncertain"].includes(result.status) && result.retryable === true && current.trigger === "schedule" && current.attempts < current.max_attempts;
+      const clearCheckpoint=result.submissionState==="signed"||result.submissionState==="unsigned"||["success","already"].includes(result.status);
       const finished = Date.now();
       const statements: D1PreparedStatement[] = [];
+      if(current.mode==="submit"&&!clearCheckpoint)statements.push(env.DB.prepare(`UPDATE accounts SET submission_checkpoint=(SELECT checkpoint FROM jobs WHERE id=?)
+        WHERE name=? AND deleted=0 AND submission_checkpoint IS NULL AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND owner=? AND status='running' AND checkpoint IS NOT NULL AND ${reportLease("jobs",finished)})`)
+        .bind(id,current.account,id,owner));
+      if(clearCheckpoint)statements.push(env.DB.prepare(`UPDATE accounts SET submission_checkpoint=NULL WHERE name=? AND deleted=0
+        AND submission_checkpoint=(SELECT checkpoint FROM jobs WHERE id=? AND owner=? AND status='running' AND lease_until>?) AND ${ownsSlotSql("job")}`)
+        .bind(current.account,id,owner,finished,id,owner,finished));
       if (rangeConfig) statements.push(env.DB.prepare(`UPDATE accounts SET config=? WHERE name=? AND deleted=0 AND (authorization_until IS NULL OR authorization_until>?)
         AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND owner=? AND status='running' AND lease_until>?)
         AND ${ownsSlotSql("job")}`).bind(rangeConfig,current.account,finished,id,owner,finished,id,owner,finished));
-      statements.push(env.DB.prepare(`UPDATE jobs SET status=?,result=?,next_at=?,finished_at=?,report_pending=1,dispatched_at=0,notification_result=NULL,notified=0,
+      statements.push(env.DB.prepare(`UPDATE jobs SET status=?,result=?,next_at=?,finished_at=?,report_pending=1,dispatched_at=0,notification_result=NULL,notified=0,recoveries=0,
         checkpoint=CASE WHEN ?=1 THEN NULL ELSE checkpoint END
         WHERE id=? AND owner=? AND status='running' AND lease_until>? AND ${ownsSlotSql("job")} AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?)) RETURNING *`)
         .bind(retry ? "pending" : "done", JSON.stringify(result), finished + (retry ? cfg.retryMs : 0), retry ? null : finished,
-          retry ? 1 : 0,id,owner,finished,id,owner,finished,finished));
+          clearCheckpoint ? 1 : 0,id,owner,finished,id,owner,finished,finished));
       const saved = await env.DB.batch(statements);
       const reporting = saved[saved.length - 1].results[0] as unknown as Job | undefined;
       if (reporting) await finishReport(env, reporting, owner);
@@ -288,13 +350,23 @@ export async function processJob(env: Env, id: string, run = execute): Promise<v
 async function release(env: Env, account: string, owner: string): Promise<void> {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM account_locks WHERE account=? AND owner=?").bind(account, owner),
-    env.DB.prepare("UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0 WHERE kind='job' AND owner=?").bind(owner)
+    env.DB.prepare("UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0,delivery_token=NULL WHERE kind='job' AND owner=?").bind(owner)
   ]);
   await syncGate(env);
 }
 export async function jobView(env: Env, ids: string[]): Promise<Record<string, unknown>[]> {
   if (!ids.length || ids.length > 50 || ids.some(id => id.length > 200)) throw new AppError("无效任务列表");
-  const rows = await env.DB.prepare(`SELECT id,account,mode,trigger,status,attempts,created_at,finished_at,result,next_at,report_pending
-    FROM jobs WHERE id IN (${ids.map(() => "?").join(",")}) AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=jobs.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?)) ORDER BY created_at,sequence_no`).bind(...ids,Date.now()).all<any>();
-  return rows.results.map(row => ({ ...row, status: row.report_pending ? "running" : row.status, result: row.result ? JSON.parse(row.result) : null }));
+  const now=Date.now();
+  const rows = await env.DB.prepare(`SELECT j.id,j.account,j.mode,j.trigger,j.status,j.attempts,j.max_attempts,j.created_at,j.finished_at,j.result,j.next_at,j.report_pending,
+    j.checkpoint IS NOT NULL AS verification_pending,b.round,b.round_due,b.concurrency_limit,b.fallback_reason
+    FROM jobs j JOIN batches b ON b.id=j.batch_id WHERE j.id IN (${ids.map(() => "?").join(",")})
+    AND EXISTS(SELECT 1 FROM accounts a WHERE a.name=j.account AND a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?)) ORDER BY j.created_at,j.sequence_no`).bind(...ids,now).all<any>();
+  return rows.results.map(row=>{
+    const result=row.result?JSON.parse(row.result):null;
+    const waitingRound=row.status==="pending"&&row.attempts>=row.round;
+    const nextAt=row.status==="pending"&&!waitingRound?Math.max(row.next_at,row.round_due):null;
+    const state=row.report_pending?"reporting":row.status==="running"?"running":row.status==="done"?"finished":waitingRound?"waiting_round":row.attempts>0?"retry_pending":"queued";
+    return {...row,result,status:row.report_pending?"running":row.status,progressState:state,remainingAttempts:Math.max(0,row.max_attempts-row.attempts),
+      nextAttemptAt:nextAt,nextAttemptText:nextAt?localTime(nextAt,settings(env).timezone):null,timezone:`UTC${settings(env).timezone>=0?"+":""}${settings(env).timezone}`,verificationPending:Boolean(row.verification_pending)};
+  });
 }

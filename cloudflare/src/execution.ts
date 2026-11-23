@@ -4,39 +4,40 @@ export const SLOT_GATE="execution-slots-v1";
 export type WorkKind="job"|"enrollment";
 // 旧Worker只认识execution_gate；新执行位持有兼容门闩，阻止滚动升级期间旧消费者绕过容量。
 export function expireSlots(env:Env,now:number):D1PreparedStatement {
-  return env.DB.prepare("UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0 WHERE lease_until<=?").bind(now);
+  return env.DB.prepare("UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0,delivery_token=NULL WHERE lease_until<=?").bind(now);
 }
 export function slotGate(env:Env,now:number,lease:number):D1PreparedStatement {
   return env.DB.prepare(`UPDATE execution_gate SET owner=?,lease_until=max(lease_until,?) WHERE id=1 AND (lease_until<=? OR owner=?)`)
     .bind(SLOT_GATE,lease,now,SLOT_GATE);
 }
-export function slotClaim(env:Env,kind:WorkKind,id:string,owner:string|null,now:number,lease:number):D1PreparedStatement {
+export function slotClaim(env:Env,kind:WorkKind,id:string,owner:string|null,now:number,lease:number,deliveryToken:string|null=null):D1PreparedStatement {
   // 升级前已开始的授权验证没有执行位，也应暂时计入共享容量。
   const legacy=`(SELECT count(*) FROM enrollment_attempts e WHERE e.status='verifying' AND e.lease_until>${Math.trunc(now)}
     AND NOT EXISTS(SELECT 1 FROM execution_slots x WHERE x.kind='enrollment' AND x.task_id=e.id AND x.lease_until>${Math.trunc(now)}))`;
-  return env.DB.prepare(`UPDATE execution_slots SET kind=?,task_id=?,owner=?,lease_until=? WHERE id=(
+  return env.DB.prepare(`UPDATE execution_slots SET kind=?,task_id=?,owner=?,lease_until=?,delivery_token=coalesce(?,delivery_token) WHERE id=(
     SELECT s.id FROM execution_slots s WHERE
       ((? IS NOT NULL AND s.kind=? AND s.task_id=? AND s.owner IS NULL AND s.lease_until>?) OR
        (s.lease_until<=? AND NOT EXISTS(SELECT 1 FROM execution_slots x WHERE x.kind=? AND x.task_id=? AND x.lease_until>?)
         AND (SELECT count(*) FROM execution_slots x WHERE x.lease_until>?)+${legacy}<(SELECT parallelism FROM execution_settings WHERE id=1)))
       AND (SELECT count(*) FROM execution_slots x WHERE x.owner IS NOT NULL AND x.lease_until>?)+${legacy}<(SELECT parallelism FROM execution_settings WHERE id=1)
+      AND (? IS NULL OR ? IS NULL OR (s.kind=? AND s.task_id=? AND s.delivery_token=?))
       AND EXISTS(SELECT 1 FROM execution_gate WHERE id=1 AND owner=?)
     ORDER BY CASE WHEN s.kind=? AND s.task_id=? AND s.lease_until>? THEN 0 ELSE 1 END,s.id LIMIT 1) RETURNING id`)
-    .bind(kind,id,owner,lease,owner,kind,id,now,now,kind,id,now,now,now,SLOT_GATE,kind,id,now);
+    .bind(kind,id,owner,lease,deliveryToken,owner,kind,id,now,now,kind,id,now,now,now,owner,deliveryToken,kind,id,deliveryToken,SLOT_GATE,kind,id,now);
 }
 export function ownsSlotSql(kind:WorkKind):string {
   return `EXISTS(SELECT 1 FROM execution_slots s WHERE s.kind='${kind}' AND s.task_id=? AND s.owner=? AND s.lease_until>?)`;
 }
-export async function reserveSlot(env:Env,kind:WorkKind,id:string,now=Date.now(),due=now):Promise<boolean> {
+export async function reserveSlot(env:Env,kind:WorkKind,id:string,now=Date.now(),due=now,deliveryToken:string|null=null):Promise<boolean> {
   const lease=Math.max(now,due)+120000;
-  const result=await env.DB.batch([expireSlots(env,now),slotGate(env,now,lease),slotClaim(env,kind,id,null,now,lease)]);
+  const result=await env.DB.batch([expireSlots(env,now),slotGate(env,now,lease),slotClaim(env,kind,id,null,now,lease,deliveryToken)]);
   const reserved=result[2].results.length>0;
   if(!reserved)await syncGate(env);
   return reserved;
 }
-export async function releaseSlot(env:Env,kind:WorkKind,id:string,owner:string|null):Promise<void> {
-  await env.DB.prepare("UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0 WHERE kind=? AND task_id=? AND owner IS ?")
-    .bind(kind,id,owner).run();
+export async function releaseSlot(env:Env,kind:WorkKind,id:string,owner:string|null,deliveryToken:string|null=null):Promise<void> {
+  await env.DB.prepare("UPDATE execution_slots SET kind=NULL,task_id=NULL,owner=NULL,lease_until=0,delivery_token=NULL WHERE kind=? AND task_id=? AND owner IS ? AND (? IS NULL OR delivery_token=?)")
+    .bind(kind,id,owner,deliveryToken,deliveryToken).run();
   await syncGate(env);
 }
 export async function syncGate(env:Env):Promise<void> {

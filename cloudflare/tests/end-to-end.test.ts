@@ -51,7 +51,9 @@ function upstream(captcha = false) {
   });
 }
 async function runQueue(id:string) {
-  const batch=createMessageBatch("jrxy-auto-cf-jobs",[{id:"message-"+id,timestamp:Date.now(),attempts:1,body:{id}}]);
+  const body=(e.JOBS.send as any).mock.calls.find((call:any)=>call[0].id===id)?.[0];
+  expect(body).toEqual({id,deliveryToken:expect.any(String)});
+  const batch=createMessageBatch("jrxy-auto-cf-jobs",[{id:"message-"+id,timestamp:Date.now(),attempts:1,body}]);
   await worker.queue(batch,e);
   const result=await getQueueResult(batch,createExecutionContext());
   expect(result.explicitAcks).toContain("message-"+id);
@@ -66,7 +68,7 @@ describe("API → Queue → original protocol → log and notification",()=>{
       const created=await api("/api/accounts","POST",account);expect(created.status).toBe(201);
       expect(created.body.account).not.toHaveProperty("password");
       const admitted=await api("/api/accounts/e2e/run","POST",{mode});expect(admitted.status).toBe(202);
-      const id=admitted.body.ids[0];expect(e.JOBS.send).toHaveBeenCalledWith({id});
+      const id=admitted.body.ids[0];expect(e.JOBS.send).toHaveBeenCalledWith({id,deliveryToken:expect.any(String)});
       await runQueue(id);
       const polled=await api("/api/jobs?ids="+encodeURIComponent(id));
       expect(polled.body.jobs[0].status).toBe("done");expect(polled.body.jobs[0].result.status).toBe(mode==="dry"?"dry":"success");

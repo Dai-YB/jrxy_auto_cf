@@ -1,5 +1,6 @@
 // 对齐 web-server/app.py: classify / notify_head / send_notify / run_and_report。
 import { AppError, type Account, type Result, LABELS } from "./types";
+import { beforeDeadline, discardBody } from "./engine/http";
 
 export function enrollmentNotify(body:Record<string,unknown>):{method:number;rcvOption:string} {
   if(body.notifyEnabled!==undefined&&typeof body.notifyEnabled!=="boolean")throw new AppError("通知开关必须为布尔值");
@@ -45,22 +46,31 @@ export async function sendNotify(account: Account, title: string, message: strin
   const option = notifyOption(account);
   if (Number(option.method) !== 2 || !option.rcvOption.trim()) return "推送未启用（账号未配置 Server酱）";
   const redactResponse = (s: string) => redact(s,[account.password, option.rcvOption, account.username, account.displayName??""]);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
+  const controller = new AbortController(),deadline=Date.now()+15_000;
+  let response:Response|undefined,reader:ReadableStreamDefaultReader<Uint8Array>|undefined,drained=false;
+  const wait=<T>(work:()=>Promise<T>)=>beforeDeadline(deadline,work,()=>new Error("Notification deadline exceeded"));
   try {
-    const response = await transport(notifyUrl(option.rcvOption), { method:"POST", redirect:"follow", signal:controller.signal,
-      headers:{"Content-Type":"application/x-www-form-urlencoded"},
-      body:new URLSearchParams({ title:[...title].slice(0,32).join(""), desp:message }).toString() });
-    const reader = response.body?.getReader(); let body=""; let total=0; const decoder=new TextDecoder();
-    if(reader)for(;;){const {value,done}=await reader.read();if(done)break;total+=value.length;
-      if(total>32768){await reader.cancel();return "推送失败：响应内容过大";} body+=decoder.decode(value,{stream:true});}
-    body+=decoder.decode();
-    if(!response.ok)return `推送失败：HTTP ${response.status} ${redactResponse(body.slice(0,200))}`;
+    const received=await wait(async()=>{
+      const next=await transport(notifyUrl(option.rcvOption), { method:"POST", redirect:"follow", signal:controller.signal,
+        headers:{"Content-Type":"application/x-www-form-urlencoded"},
+        body:new URLSearchParams({ title:[...title].slice(0,32).join(""), desp:message }).toString() });
+      if(controller.signal.aborted)discardBody(next);else response=next;
+      return next;
+    });
+    reader=received.body?.getReader();let body="";let total=0;const decoder=new TextDecoder();
+    if(reader){const currentReader=reader;for(;;){const {value,done}=await wait(()=>currentReader.read());if(done)break;total+=value.length;
+      if(total>32768)return "推送失败：响应内容过大";body+=decoder.decode(value,{stream:true});}}
+    drained=true;body+=decoder.decode();
+    if(!received.ok)return `推送失败：HTTP ${received.status} ${redactResponse(body.slice(0,200))}`;
     let data:any;
     try{data=JSON.parse(body);}catch{return "推送已发送（非 JSON 响应）";}
     const code=data?.code??0;
     if(code===0||code==="0")return "推送成功（Server酱已接收）";
     return `推送失败：code=${String(code)} ${redactResponse(String(data?.message||data?.info||"").slice(0,200))}`;
   } catch { return "推送失败：网络请求异常、超时或推送地址无效"; }
-  finally { clearTimeout(timer); }
+  finally {
+    // 报告不能被忽略abort或挂起的cancel拖住；签到结果已独立持久化。
+    if(!drained){discardBody(response,reader);controller.abort();}
+    try{reader?.releaseLock();}catch{}
+  }
 }
