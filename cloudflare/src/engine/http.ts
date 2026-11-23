@@ -1,4 +1,5 @@
-import { EngineError, type RequestDiagnostic, type RequestStage } from "../types";
+import { EngineError, type RequestDiagnostic, type RequestStage, type RequestTrace } from "../types";
+import { MAX_REQUEST_TRACE, safeRequestTrace, transportErrorCode } from "../diagnostics";
 import { getDomain } from "tldts";
 import { pythonJson } from "./encoding";
 import { DEFAULT_HTTP_TIMEOUT_SECONDS, DEFAULT_RUN_TIMEOUT_SECONDS } from "../config";
@@ -85,17 +86,24 @@ export class Session {
   private startedAt: number;
   private stage: RequestStage = "request";
   private last?: Omit<RequestDiagnostic,"stage"|"kind">;
+  private requests:RequestTrace[]=[];
+  private currentTrace?:RequestTrace;
   constructor(private transport: typeof fetch = fetch, private timeoutMs = DEFAULT_HTTP_TIMEOUT_SECONDS*1000, runTimeoutMs = DEFAULT_RUN_TIMEOUT_SECONDS*1000) {
     this.startedAt=Date.now();
     this.deadline = this.startedAt + runTimeoutMs;
   }
   at(stage: RequestStage): this { this.stage=stage;return this; }
   diagnostic(kind: RequestDiagnostic["kind"]): RequestDiagnostic { return {...this.last,stage:this.stage,kind}; }
+  trace():RequestTrace[] {return safeRequestTrace(this.requests);}
+  private markFailure(kind:RequestDiagnostic["kind"]):void {
+    if(this.currentTrace)Object.assign(this.currentTrace,this.last,{outcome:"failed",kind});
+  }
   private failure(message: string, kind: RequestDiagnostic["kind"], retryable = false): EngineError {
+    this.markFailure(kind);
     return new EngineError(message,retryable?"error":"fail",retryable,this.diagnostic(kind));
   }
   async request(input: string, options: RequestInit = {}, follow = true, timeoutMs = this.timeoutMs): Promise<HttpResult> {
-    this.last=undefined;
+    this.last=undefined;this.currentTrace=undefined;
     let url: URL;
     try { url=publicUrl(input); }
     catch { throw this.failure("仅允许公网 HTTPS 域名，不支持本地代理或校园内网地址","policy"); }
@@ -108,12 +116,16 @@ export class Session {
       const timing: Omit<RequestDiagnostic,"stage"|"kind"> = {host:url.hostname,method:["GET","POST","HEAD"].includes(method)?method as "GET"|"POST"|"HEAD":undefined,
         phase:"send",requestIndex:++this.count,redirectCount:hop,timeoutMs,receivedBytes:0};
       this.last=timing;
-      let lastProgress=started;
+      const entry:RequestTrace={...timing,startedAt:started,stage:this.stage,outcome:"started"};
+      this.currentTrace=entry;if(this.requests.length<MAX_REQUEST_TRACE)this.requests.push(entry);
+      let lastProgress=started,headersAt:number|undefined;
       const recordTime=()=>{
         const now=Date.now();
         timing.elapsedMs=Math.max(0,now-started);
         timing.sessionElapsedMs=Math.max(0,now-this.startedAt);
         timing.idleMs=Math.max(0,now-lastProgress);
+        Object.assign(entry,timing);
+        if(headersAt!==undefined)entry.bodyMs=Math.max(0,now-headersAt);
       };
       const waitForProgress=<T>(work:()=>Promise<T>):Promise<T>=>{
         const idleDeadline=lastProgress+timeoutMs;
@@ -142,8 +154,13 @@ export class Session {
           if(abort.signal.aborted)discardBody(next);else response=next;
           return next;
         });
-        lastProgress=Date.now();
+        lastProgress=Date.now();headersAt=lastProgress;
         timing.phase="headers";timing.httpStatus=received.status;
+        entry.outcome="headers";entry.headersMs=Math.max(0,headersAt-started);
+        const contentType=received.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase()??"";
+        entry.responseType=contentType==="application/json"||contentType.endsWith("+json")?"json":contentType==="text/html"?"html":contentType.startsWith("text/")?"text":"other";
+        const ray=received.headers.get("CF-Ray");if(ray&&/^[a-f0-9]{16,32}-[A-Z]{3}$/i.test(ray))entry.rayId=ray;
+        Object.assign(entry,timing);
         for (const value of responseCookies(received.headers)) this.jar.set(value, url);
         timing.phase="body";
         reader=received.body?.getReader();
@@ -168,7 +185,8 @@ export class Session {
         result = { status: received.status, url: url.href, headers: received.headers, text: new TextDecoder().decode(bytes) };
       } catch (e) {
         recordTime();
-        if (e instanceof EngineError) { e.diagnostic??=this.diagnostic("response");throw e; }
+        if (e instanceof EngineError) { e.diagnostic??=this.diagnostic("response");this.markFailure(e.diagnostic.kind);throw e; }
+        entry.errorCode=transportErrorCode(e);
         if(timing.phase==="send"&&e instanceof TypeError&&e.message.startsWith("Illegal invocation"))
           throw this.failure("Worker请求函数调用异常，尚未发出请求；请联系管理员检查部署版本","internal");
         if(timing.phase==="send")throw this.failure("发送上游请求失败，尚未取得响应（DNS、TLS或连接原因待核实）","transport",true);
@@ -188,10 +206,12 @@ export class Session {
           method = "GET"; body = undefined; headers.delete("Content-Type");
         } else if (next.origin !== url.origin && body) throw this.failure("拒绝将登录数据重定向到其他域名","policy");
         headers.delete("Cookie"); headers.delete("Authorization");
+        entry.outcome="completed";
         url = next;
         continue;
       }
       if (result.status >= 500) throw this.failure(`上游服务暂不可用（HTTP ${result.status}）`,"http",true);
+      entry.outcome="completed";
       return result;
     }
     throw this.failure("登录重定向次数过多","redirect_limit");

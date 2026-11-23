@@ -24,4 +24,5 @@ th{font-size:12px;color:#71848f}
 .stat-label{font-size:12px}.stat-note{font-size:11px}.row-actions .button{font-size:12px}
 .form-grid label,.form-section label{font-size:12px}.dialog-footer>p{font-size:11px;color:#768b96}
 .confirm-content p{font-size:13px;color:#647b88}.confirm-danger{background:#b54740!important;border-color:#b54740!important}
+.task-result>.task-diagnostics{display:block;margin-top:12px}.diagnostic-panel{margin-top:10px;border:1px solid #dce5eb;border-radius:8px;padding:10px;background:#fff;min-width:0}.diagnostic-panel>summary{display:block!important;font-size:12px;color:#365468;cursor:pointer;overflow-wrap:anywhere}.diagnostic-panel>pre{max-height:360px;overflow:auto;font:12px/1.8 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:#405565}.diagnostic-copy{width:100%;font:12px/1.6 ui-monospace,Consolas,monospace;margin-top:10px;resize:vertical;min-height:160px}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{transition:none!important;animation:none!important}}

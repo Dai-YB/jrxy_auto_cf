@@ -2,6 +2,7 @@ export interface Env {
   DB: D1Database;
   JOBS: Queue<{ id: string; kind?: "enrollment"; deliveryToken?: string }>;
   ASSETS: Fetcher;
+  VERSION_METADATA?: {id:string;tag?:string;timestamp?:string};
   ADMIN_USERNAME: string;
   ADMIN_PASSWORD: string;
   ENCRYPTION_KEY: string;
@@ -61,6 +62,8 @@ export interface Result {
   submissionState?: "signed" | "unsigned" | "unknown";
   transientFailure?: boolean;
   diagnostic?: RequestDiagnostic;
+  requestTrace?: RequestTrace[];
+  executionReport?: ExecutionReport;
   data?: Record<string, unknown>;
 }
 export interface Job {
@@ -138,6 +141,35 @@ export interface RequestDiagnostic {
   requestIndex?: number;
   redirectCount?: number;
   receivedBytes?: number;
+}
+export interface RequestTrace extends Omit<RequestDiagnostic,"kind"> {
+  startedAt:number;
+  outcome:"started"|"headers"|"completed"|"failed";
+  kind?:RequestDiagnostic["kind"];
+  headersMs?:number;
+  bodyMs?:number;
+  responseType?:"json"|"html"|"text"|"other";
+  rayId?:string;
+  errorCode?:"ECONNRESET"|"ECONNREFUSED"|"ETIMEDOUT"|"ENOTFOUND"|"EAI_AGAIN"|"CERT_HAS_EXPIRED"|"ERR_TLS_CERT_ALTNAME_INVALID"|"UNABLE_TO_VERIFY_LEAF_SIGNATURE";
+}
+export interface ExecutionReport {
+  schema:1;
+  id:string;
+  version?:string;
+  startedAt:number;
+  finishedAt:number;
+  mode:Mode;
+  trigger:"manual"|"schedule";
+  attempt:number;
+  maxAttempts:number;
+  batchRound:number;
+  concurrencyLimit:number;
+  verificationOnly:boolean;
+  result:Result["status"];
+  retryable:boolean;
+  network:{httpTimeoutMs:number;runTimeoutMs:number;submitTimeoutMs:number};
+  requests:RequestTrace[];
+  truncated:boolean;
 }
 export class EngineError extends Error {
   constructor(message: string, public status: Result["status"] = "fail", public retryable = false, public diagnostic?: RequestDiagnostic) { super(message); }

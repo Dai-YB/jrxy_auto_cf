@@ -57,6 +57,12 @@ describe("non-destructive administrator upgrade",()=>{
     expect(await e.DB.prepare("SELECT submission_checkpoint FROM accounts WHERE name='resolved'").first("submission_checkpoint")).toBeNull();
     expect(await e.DB.prepare("SELECT max_attempts FROM jobs WHERE id='unresolved-old'").first("max_attempts")).toBe(3);
   });
+  it("adds nullable execution reports without changing old logs or task results",async()=>{
+    await reset();await applyD1Migrations(e.DB,e.TEST_MIGRATIONS.slice(0,9));
+    await e.DB.prepare("INSERT INTO sign_log(ts,kind,result,detail) VALUES(1,'历史','执行异常','旧详情')").run();
+    const before=await e.DB.prepare("SELECT * FROM sign_log").first<any>();
+    await applyD1Migrations(e.DB,e.TEST_MIGRATIONS);expect(await e.DB.prepare("SELECT * FROM sign_log").first()).toEqual({...before,diagnostic:null});
+  });
   it("preserves old encrypted accounts, device IDs, plans and logs",async()=>{
     await reset();await applyD1Migrations(e.DB,e.TEST_MIGRATIONS.slice(0,3));
     const config=await seal({schoolName:"旧学校",username:"old-user",password:"original-password",type:2,lon:1,lat:2,address:"地址",abnormalReason:"",notifyKey:"SCTold"},e.ENCRYPTION_KEY,"account:old");

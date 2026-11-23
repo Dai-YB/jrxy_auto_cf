@@ -4,6 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-10",
   "compatibility_flags": ["nodejs_compat"],
+  "version_metadata": { "binding": "VERSION_METADATA" },
   "assets": { "directory": "./public", "binding": "ASSETS", "html_handling": "none", "run_worker_first": ["/api/*", "/", "/admin", "/admin/"] },
   "d1_databases": [{
     "binding": "DB", "database_name": "jrxy-auto-cf",

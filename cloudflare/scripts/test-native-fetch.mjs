@@ -113,6 +113,9 @@ try{
     const result=await run({action:"execute",user,deviceId:scenario.deviceId,mode:scenario.mode});
     assert.equal(result.status,scenario.mode==="dry"?"dry":"success",scenario.name+": "+JSON.stringify(result));
     assert.equal(index,scenario.calls.length,scenario.name+": original request count mismatch");
+    assert.equal(result.requestTrace.length,scenario.calls.length,scenario.name+": trace must not add requests");
+    assert.ok(result.requestTrace.every(entry=>entry.outcome==="completed"),scenario.name+": completed response trace missing");
+    assert.equal(result.requestTrace.some(entry=>entry.url!==undefined||entry.body!==undefined||entry.cookie!==undefined),false);
     assert.deepEqual(wireErrors,[],scenario.name+": native request metadata mismatch");checks++;
   }
   for(const scenario of traces.cases.filter(value=>value.mode==="login")){

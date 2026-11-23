@@ -43,6 +43,9 @@ describe("request traces captured from original Python entry points",()=>{
       const result=await execute({...scenario.user,notifyKey:""} as Account,scenario.deviceId,scenario.mode as Mode,{beforeSubmit:async()=>{},confirmDelayMs:0});
       expect(actual).toEqual(scenario.calls.map(call=>call.request));
       expect(result.status).toBe(scenario.mode==="dry"?"dry":"success");
+      expect(result.requestTrace).toHaveLength(scenario.calls.length);
+      expect(result.requestTrace!.every(request=>request.outcome==="completed")).toBe(true);
+      expect(result.requestTrace!.map(request=>request.requestIndex)).toEqual(scenario.calls.map((_,index)=>index+1));
       expect(transport.mock.calls.filter(([url])=>String(url).endsWith("/submitSign"))).toHaveLength(scenario.mode==="submit"?1:0);
     }finally{transport.mockRestore();random.mockRestore();fixed.mockRestore();}
   });

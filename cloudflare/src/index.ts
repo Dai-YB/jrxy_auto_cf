@@ -7,6 +7,7 @@ import { admitJobs, dispatch, jobView, processJob } from "./jobs";
 import { localTime, scheduleView, tick, updateSchedule } from "./scheduler";
 import { extractDeviceId } from "./engine/device";
 import { settings } from "./config";
+import { safeExecutionReport } from "./diagnostics";
 import { executionView, updateExecution } from "./execution";
 import { createCodeBatch, listCodeBatches, listEnrollments, copyCodes, revokeCodes, revokeCode, publicRedemption, processEnrollment, dispatchEnrollments } from "./redemption";
 
@@ -100,11 +101,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (path === "/api/logs" && method === "GET") {
     const raw = Number(url.searchParams.get("limit") ?? 50);
     const limit = Number.isFinite(raw) ? Math.max(1,Math.min(Math.trunc(raw),200)) : 50;
-    const logs = await env.DB.prepare(`SELECT ts,account,kind,result,detail FROM sign_log WHERE
+    const logs = await env.DB.prepare(`SELECT id,ts,account,kind,result,detail,diagnostic FROM sign_log WHERE
       NOT EXISTS(SELECT 1 FROM accounts a WHERE a.name=sign_log.account AND a.grant_code_id IS NOT NULL AND a.authorization_until<=?)
       AND NOT EXISTS(SELECT 1 FROM jobs j JOIN accounts a ON a.name=j.account WHERE j.batch_id=sign_log.batch_id AND a.grant_code_id IS NOT NULL AND a.authorization_until<=?)
       ORDER BY id DESC LIMIT ?`).bind(Date.now(),Date.now(),limit).all<any>();
-    return json({ logs: logs.results.map(row => ({...row,ts:localTime(row.ts,settings(env).timezone)})) });
+    return json({ logs: logs.results.map(row => {
+      let diagnostic=null;try{diagnostic=safeExecutionReport(JSON.parse(row.diagnostic??"null"));}catch{}
+      return {...row,diagnostic,ts:localTime(row.ts,settings(env).timezone)};
+    }) });
   }
   if (path === "/api/logs/clear" && method === "POST") {
     await env.DB.prepare("DELETE FROM sign_log").run();

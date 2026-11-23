@@ -123,6 +123,10 @@ describe("real queue consumer with isolated school protocol failures",()=>{
       expect(JSON.parse(job!.result!).status).toBe(scenario==="unknown"?"uncertain":"success");
       expect(mock.submits).toHaveLength(scenario==="unsigned"?2:1);expect(job!.attempts).toBe(scenario==="unknown"?6:scenario==="unsigned"?2:1);expect(mock.notifies).toHaveLength(1);
       expect(Boolean(job!.checkpoint)).toBe(scenario==="unknown");
+      const firstLog=await e.DB.prepare("SELECT diagnostic FROM sign_log WHERE account='a' AND diagnostic IS NOT NULL ORDER BY id LIMIT 1").first<string>("diagnostic");
+      const trace=JSON.parse(firstLog!).requests;expect(trace.filter((row:any)=>row.stage==="submit")).toHaveLength(1);
+      expect(trace.find((row:any)=>row.stage==="submit")).toMatchObject({outcome:"failed",kind:"transport"});expect(trace.some((row:any)=>row.stage==="confirmation")).toBe(true);
+      expect(JSON.stringify(trace)).not.toMatch(/synthetic-password|SCTsynthetic|fixed-a|MOD_AUTH_CAS/);
       if(scenario==="unknown"){
         const [manual]=await enqueue(e,["a"],"submit");await drain();expect(mock.submits).toHaveLength(1);
         expect(JSON.parse((await e.DB.prepare("SELECT result FROM jobs WHERE id=?").bind(manual).first<string>("result"))!).status).toBe("uncertain");

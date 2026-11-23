@@ -5,6 +5,7 @@ import {randomBytes} from "node:crypto";
 import {createCodeBatch,publicRedemption,processEnrollment} from "../src/redemption";
 import {saveAccount} from "../src/storage";
 import {tick,updateSchedule,scheduleView} from "../src/scheduler";
+import {cleanupExpiredAccounts} from "../src/expiry";
 import {enqueue,processJob} from "../src/jobs";
 import type {Env} from "../src/types";
 const bindings=env as unknown as Env&{TEST_MIGRATIONS:any[]};let e:Env;
@@ -53,6 +54,13 @@ describe("expiry at all execution gates",()=>{
     const name=await enroll();await e.DB.prepare("UPDATE accounts SET authorization_until=? WHERE name=?").bind(Date.now()-1,name).run();
     await expect(enqueue(e,[name],"submit")).rejects.toMatchObject({code:410});
     expect((await e.DB.prepare("SELECT count(*) AS n FROM jobs").first<any>()).n).toBe(0);
+  });
+  it("removes stored execution reports with the expired account and never recreates them",async()=>{
+    const name=await enroll(),[id]=await enqueue(e,[name],"login"),run=vi.fn().mockResolvedValue({status:"success",message:"synthetic login"});
+    await processJob(e,id,run);expect(await e.DB.prepare("SELECT count(*) FROM sign_log WHERE account=? AND diagnostic IS NOT NULL").bind(name).first("count(*)")).toBe(1);
+    await e.DB.prepare("UPDATE accounts SET authorization_until=? WHERE name=?").bind(Date.now()-1,name).run();await cleanupExpiredAccounts(e);
+    expect(await e.DB.prepare("SELECT count(*) FROM sign_log WHERE account=?").bind(name).first("count(*)")).toBe(0);
+    await processJob(e,id,run);expect(run).toHaveBeenCalledTimes(1);expect(await e.DB.prepare("SELECT id FROM jobs WHERE id=?").bind(id).first()).toBeNull();
   });
   it("expiry during a failed scheduled attempt never starts another retry",async()=>{
     const name=await enroll();const [id]=await enqueue(e,[name],"submit");await e.DB.prepare("UPDATE jobs SET trigger='schedule',max_attempts=3 WHERE id=?").bind(id).run();

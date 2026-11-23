@@ -71,7 +71,7 @@ describe("queue ownership and cross-attempt recovery",()=>{
     const [id]=await enqueue(e,["a"],"submit");
     await e.DB.prepare("UPDATE jobs SET status='done',result=?,report_pending=1,attempts=1,notification_result='disabled' WHERE id=?").bind(JSON.stringify({status:"success",message:"ok"}),id).run();
     let expire=true;
-    const fenced=interceptBatch(sql=>sql.startsWith("INSERT INTO sign_log(ts,account,kind,result,detail,batch_id)"),async()=>{if(!expire)return;expire=false;await e.DB.prepare("UPDATE jobs SET lease_until=0 WHERE id=?").bind(id).run();await e.DB.prepare("UPDATE execution_slots SET lease_until=0 WHERE task_id=?").bind(id).run();});
+    const fenced=interceptBatch(sql=>sql.startsWith("INSERT INTO sign_log(ts,account,kind,result,detail,batch_id,"),async()=>{if(!expire)return;expire=false;await e.DB.prepare("UPDATE jobs SET lease_until=0 WHERE id=?").bind(id).run();await e.DB.prepare("UPDATE execution_slots SET lease_until=0 WHERE task_id=?").bind(id).run();});
     const run=vi.fn();await processJob(fenced,id,run);expect((await row(id)).report_pending).toBe(1);
     expect(await e.DB.prepare("SELECT count(*) FROM sign_log WHERE kind='手动签到[a]'").first("count(*)")).toBe(0);
     await processJob(e,id,run);expect(run).not.toHaveBeenCalled();expect((await row(id)).report_pending).toBe(0);
@@ -79,9 +79,12 @@ describe("queue ownership and cross-attempt recovery",()=>{
   });
   it("a report transaction failure recovers without replaying the engine",async()=>{
     const [id]=await enqueue(e,["a"],"submit");let fail=true;
-    const broken=interceptBatch(sql=>sql.startsWith("INSERT INTO sign_log(ts,account,kind,result,detail,batch_id)"),async()=>{if(fail){fail=false;throw new Error("synthetic D1 interruption");}});
+    const broken=interceptBatch(sql=>sql.startsWith("INSERT INTO sign_log(ts,account,kind,result,detail,batch_id,"),async()=>{if(fail){fail=false;throw new Error("synthetic D1 interruption");}});
     const run=vi.fn().mockResolvedValue({status:"success",message:"ok"});await expect(processJob(broken,id,run)).rejects.toThrow("恢复");
-    expect((await row(id)).report_pending).toBe(1);await processJob(e,id,run);expect(run).toHaveBeenCalledTimes(1);expect((await row(id)).report_pending).toBe(0);
+    expect((await row(id)).report_pending).toBe(1);const report=JSON.parse((await row(id)).result!).executionReport;
+    await processJob(e,id,run);expect(run).toHaveBeenCalledTimes(1);expect((await row(id)).report_pending).toBe(0);
+    const reports=(await e.DB.prepare("SELECT diagnostic FROM sign_log WHERE kind='手动签到[a]'").all<{diagnostic:string}>()).results;
+    expect(reports).toHaveLength(1);expect(JSON.parse(reports[0].diagnostic).id).toBe(report.id);
   });
   it("recovers a lost result transaction by checking the submitted target, not resubmitting",async()=>{
     const [id]=await enqueue(e,["a"],"submit");let fail=true;

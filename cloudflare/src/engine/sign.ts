@@ -5,7 +5,7 @@ import { login, type Login } from "./login";
 import { requireDeviceId } from "./device";
 import { IOS_UA, Session } from "./http";
 import { localTime } from "../config";
-import { safeDiagnostic } from "../diagnostics";
+import { safeDiagnostic, safeRequestTrace } from "../diagnostics";
 
 export interface Checkpoint { signInstanceWid: string; signWid: string; }
 export interface ExecutionOptions {
@@ -108,13 +108,13 @@ function rangeResult(task: any, signWid?: unknown): Result {
   return { status: "success", message: "签到范围已获取", data: { ...ranges[0],ranges,
     signInstanceWid:task.signInstanceWid,signWid,taskName: String(task.taskName ?? ""), window_begin: task.singleTaskBeginTime ?? "", window_end: task.singleTaskEndTime ?? "" } };
 }
-async function runExecution(account: Account, deviceId: string, mode: Mode, options: ExecutionOptions, trace: string[]): Promise<Result> {
+async function runExecution(account: Account, deviceId: string, mode: Mode, options: ExecutionOptions, trace: string[],session:Session): Promise<Result> {
   let submitted = Boolean(options.checkpoint);
   try { requireDeviceId(deviceId); }
   catch { return { status: "fail", message: "已保存的 deviceId 缺失或格式无效，未发起登录；请检查账号设备配置" }; }
   try {
     trace.push("步骤 1/5 登录（使用已保存的固定设备标识）");
-    const auth = await (options.loginFn ?? login)(account,new Session(fetch,options.httpTimeoutMs,options.runTimeoutMs),mode);
+    const auth = await (options.loginFn ?? login)(account,session,mode);
     trace.push("登录成功；Cookie 与会话令牌不写入日志");
     if(mode === "login")return {status:"success",message:"登录成功",data:{host:auth.host,cookies:auth.session.jar.names()}};
     const api = paths(account.type);
@@ -201,8 +201,10 @@ async function runExecution(account: Account, deviceId: string, mode: Mode, opti
 }
 export async function execute(account: Account, deviceId: string, mode: Mode, options: ExecutionOptions = {}): Promise<Result> {
   const trace: string[] = [];
-  const result = await runExecution(account,deviceId,mode,options,trace);
-  const diagnostic=safeDiagnostic(result.diagnostic,[account.password,account.username,account.displayName??"",account.notifyOption?.rcvOption??account.notifyKey]);
+  const session=new Session(fetch,options.httpTimeoutMs,options.runTimeoutMs);
+  const result = await runExecution(account,deviceId,mode,options,trace,session);
+  const privateValues=[account.password,account.username,account.displayName??"",account.notifyOption?.rcvOption??account.notifyKey,deviceId,account.address];
+  const diagnostic=safeDiagnostic(result.diagnostic,privateValues);
   // 诊断保持结构化；报告层脱敏业务文本后再格式化，避免固定枚举被误替换。
-  return {...result,diagnostic:diagnostic??undefined,detail:[...trace,result.message].join("\n")};
+  return {...result,diagnostic:diagnostic??undefined,requestTrace:safeRequestTrace(session.trace(),privateValues),detail:[...trace,result.message].join("\n")};
 }

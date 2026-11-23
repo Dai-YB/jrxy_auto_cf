@@ -53,6 +53,7 @@ function showLogin() {
   for(const dialog of [$("accountDialog"),$("confirmDialog")])if(dialog.open)dialog.close();
   if(confirmResolve){confirmResolve(false);confirmResolve=null;}
   $("accountForm").reset();$("accountRows").replaceChildren();$("accountCards").replaceChildren();$("logList").replaceChildren();
+  $("taskDiagnostics").replaceChildren();delete $("taskDiagnostics").dataset.reportKey;
   $("codeBatchForm").reset();$("codeBatchList").replaceChildren();$("enrollmentList").replaceChildren();hideGeneratedCodes();
   $("boot").hidden=true;$("appView").hidden=true;$("loginView").hidden=false;$("taskResult").hidden=true;$("toast").hidden=true;
   $("loginPassword").value="";
@@ -175,16 +176,64 @@ $("executionForm").addEventListener("submit",async event=>{
   if(!await confirmAction("保存并发上限？",`最多同时执行${parallelism}个学校账号任务，仍受免费额度和学校限制。已开始任务自然结束，不修改每日计划开关。`,"保存执行设置"))return;
   submit.disabled=true;try{await api("/api/execution","POST",{parallelism});executionDirty=false;await loadStatus();toast("执行设置已保存");}catch(error){showError(error);}finally{submit.disabled=false;}
 });
+function diagnosticText(report) {
+  const lines=[`诊断编号：${report.id}`,`Worker版本：${report.version||"未提供"}`,`UTC开始：${new Date(report.startedAt).toISOString()} · 结束：${new Date(report.finishedAt).toISOString()}`,
+    `模式：${modes[report.mode]||report.mode} · ${report.trigger==="schedule"?"定时":"手动"} · 本账号第${report.attempt}/${report.maxAttempts}次 · 批次第${report.batchRound}轮 · 并发${report.concurrencyLimit}`,
+    `结果：${labels[report.result]||report.result} · 可重试：${report.retryable?"是":"否"} · 仅复查：${report.verificationOnly?"是":"否"}`,
+    `网络预算：普通请求${report.network.httpTimeoutMs/1000}秒 / 单账号${report.network.runTimeoutMs/1000}秒 / 提交${report.network.submitTimeoutMs/1000}秒`];
+  if(!report.requests.length)lines.push("没有可用请求轨迹：可能在发出请求前停止，或此执行未采集网络记录。");
+  const outcomes={started:"已开始，尚无完成记录",headers:"已收到响应头",completed:"请求完成",failed:"请求失败"};
+  for(const row of report.requests){
+    lines.push(`\n#${row.requestIndex??"?"} ${row.stage} · ${row.method||"?"} ${row.host||"[域名已隐藏]"} · ${outcomes[row.outcome]||"未知"}`,
+      `开始 ${new Date(row.startedAt).toISOString()} · 跳转${row.redirectCount??0} · 阈值${row.timeoutMs??"?"}ms`,
+      `总耗时${row.elapsedMs??"?"}ms · 会话累计${row.sessionElapsedMs??"?"}ms · 已读${row.receivedBytes??0}字节`);
+    if(row.headersMs!=null)lines.push(`收到响应头：${row.headersMs}ms · 正文读取：${row.bodyMs??"?"}ms · HTTP ${row.httpStatus??"?"} · ${row.responseType||"other"}`);
+    else lines.push("未取得响应头；无法区分DNS、TLS、连接等待或上游处理，也不能证明请求未送达。");
+    if(row.kind)lines.push(`分类：${row.kind} · 环节：${row.phase||"未知"} · 无进展：${row.idleMs??"?"}ms`);
+    if(row.errorCode)lines.push("底层错误码："+row.errorCode);
+    if(row.rayId)lines.push("上游Ray ID："+row.rayId);
+  }
+  if(report.truncated)lines.push("轨迹超过安全大小上限，部分记录已省略。");
+  lines.push("\n请求完成仅表示网络响应已读完，不等同签到成功。未包含账号身份、凭据、设备、位置、完整URL或响应正文。");
+  return lines.join("\n");
+}
+function diagnosticBundle(reports) {
+  const selected=reports.slice(0,10);
+  return JSON.stringify({format:"jrxy-safe-diagnostics-v1",note:"仅含脱敏元数据；无响应头不能判定DNS、TLS或上游根因。",omitted:Math.max(0,reports.length-selected.length),
+    tasks:selected.map((report,index)=>({label:`任务${index+1}`,report}))},null,2);
+}
+async function copyDiagnostic(reports,container) {
+  const text=diagnosticBundle(reports);
+  try{await navigator.clipboard.writeText(text);toast("已复制脱敏诊断，可粘贴反馈；不含账号或凭据");}
+  catch{
+    const existing=container.querySelector("textarea.diagnostic-copy");if(existing)existing.remove();
+    const field=element("textarea",undefined,"diagnostic-copy");field.value=text;field.readOnly=true;field.rows=8;field.setAttribute("aria-label","脱敏诊断文本");container.append(field);field.focus();field.select();toast("浏览器未允许自动复制，请复制已选中的诊断文本");
+  }
+}
+function diagnosticPanel(report,label="逐请求诊断") {
+  const details=element("details",undefined,"diagnostic-panel");details.append(element("summary",label),element("pre",diagnosticText(report)));
+  details.append(button("复制脱敏诊断",()=>copyDiagnostic([report],details),"text-button"));return details;
+}
+function renderTaskDiagnostics(jobs) {
+  const box=$("taskDiagnostics"),reports=jobs.map(job=>job.result?.executionReport).filter(Boolean);
+  const key=jobs.map(job=>job.result?.executionReport?.id||"none").join(",");if(box.dataset.reportKey===key)return;
+  box.dataset.reportKey=key;box.replaceChildren();
+  if(reports.length){box.append(button("复制本次脱敏诊断（最多10条）",()=>copyDiagnostic(reports,box),"text-button"));reports.forEach((report,index)=>box.append(diagnosticPanel(report,`任务${index+1} · 第${report.attempt}次逐请求诊断`)));}
+  else box.append(element("p","本轮尚无详细诊断。请求结束后显示；旧版本记录或平台中断可能没有完整轨迹。","field-note"));
+}
 async function loadLogs() {
   const result=await api("/api/logs?limit=100");if(!signedIn)return;
+  const expanded=new Set([...$("logList").querySelectorAll("details.log-entry[open]")].map(item=>item.dataset.logId));
   $("logList").replaceChildren();$("logEmpty").hidden=result.logs.length>0;
   for(const log of result.logs) {
-    const details=element("details",undefined,"log-entry");const summary=element("summary");
+    const details=element("details",undefined,"log-entry");details.dataset.logId=String(log.id);details.open=expanded.has(String(log.id));const summary=element("summary");
     const kind=/失败|异常|错误/.test(log.result)?"bad":/暂停|未知|暂无|验证|跳过|待确认/.test(log.result)?"warn":"ok";
     const info=element("div",undefined,"log-info");info.append(element("span",undefined,"log-dot "+kind));
     const text=element("div",undefined,"log-text");text.append(element("b",log.kind),element("small",log.ts));info.append(text);
     summary.append(info,badge(log.result,kind));summary.title=log.result;
-    details.append(summary,element("pre",log.detail||"无详情"));$("logList").append(details);
+    details.append(summary,element("pre",log.detail||"无详情"));
+    if(log.diagnostic)details.append(diagnosticPanel(log.diagnostic));else details.append(element("p","此记录没有详细请求轨迹（旧记录或非学校执行日志）。","field-note"));
+    $("logList").append(details);
   }
 }
 async function loadEnrollments(){
@@ -254,6 +303,7 @@ function trackTask(ids,mode,label,resolve,reject,note="") {
     resolve:jobs=>{priorResolve?.(jobs);resolve?.(jobs);},reject:error=>{priorReject?.(error);reject?.(error);}});
   pending.set(key,task);
   visibleTaskKey=key;persistTasks();
+  $("taskDiagnostics").replaceChildren();delete $("taskDiagnostics").dataset.reportKey;
   $("taskResult").hidden=false;$("taskTitle").textContent=label;$("taskDetail").textContent=(note?note+"\n\n":"")+"正在读取原任务或新任务进度…";
 }
 async function runTask(path,mode,label) {
@@ -294,13 +344,14 @@ async function pollJobs() {
       if(!signedIn)return;
       if(jobs.length!==task.ids.length){
         pending.delete(key);persistTasks();task.resolve?.([]);
-        if(key===visibleTaskKey)$("taskDetail").textContent="部分账号已到期或删除，相关任务记录已清理。";
+        if(key===visibleTaskKey){$("taskDetail").textContent="部分账号已到期或删除，相关任务记录已清理。";$("taskDiagnostics").replaceChildren();delete $("taskDiagnostics").dataset.reportKey;}
         continue;
       }
       const done=jobs.filter(job=>job.status==="done").length;
       if(key===visibleTaskKey) {
         $("taskTitle").textContent=task.label+(done===jobs.length?" · 已结束（请核对结果）":` · 已结束 ${done}/${jobs.length}`);
         $("taskDetail").textContent=(task.note?task.note+"\n\n":"")+jobs.map(jobProgress).join("\n\n");
+        renderTaskDiagnostics(jobs);
       }
       if(done===jobs.length){pending.delete(key);persistTasks();task.resolve?.(jobs);await Promise.all([loadLogs(),loadAccounts(),loadStatus()]);}
     }

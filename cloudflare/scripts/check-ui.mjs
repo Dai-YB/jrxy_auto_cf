@@ -46,7 +46,7 @@ assert.match(render({...sample,progressState:"finished",result:{status:"no_task"
 assert.match(render({...sample,progressState:"finished",result:{status:"error"}}),/不代表签到成功/);
 const admission=js.slice(js.indexOf("function admissionNotice(result)"),js.indexOf("async function runTask("));
 const admissionContext={};
-const admissionApi=new Script(`const pending=new Map(),nodes=new Map();const $=id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);};let visibleTaskKey='';const persistTasks=()=>{};${admission};({admissionNotice,trackTask,pending})`).runInNewContext(admissionContext);
+const admissionApi=new Script(`const pending=new Map(),nodes=new Map();const $=id=>{if(!nodes.has(id))nodes.set(id,{dataset:{},replaceChildren(){}});return nodes.get(id);};let visibleTaskKey='';const persistTasks=()=>{};${admission};({admissionNotice,trackTask,pending})`).runInNewContext(admissionContext);
 assert.match(admissionApi.admissionNotice({ids:['one'],created:0,continued:1,reasons:{}}),/接续原任务1个/);
 assert.match(admissionApi.admissionNotice({ids:['one'],completed:1,reasons:{}}),/不重签/);
 assert.match(admissionApi.admissionNotice({ids:[],total:1,reasons:{busy:1}}),/登录测试、探测等操作占用1个/);
@@ -62,4 +62,11 @@ const budgetText=new Script(`${budgetSource};networkBudgetText`).runInNewContext
 assert.match(budgetText({httpTimeoutSeconds:60,runTimeoutSeconds:300,submitTimeoutSeconds:20}),/普通请求60秒.*总时限300秒.*提交20秒/);
 assert.match(budgetText({httpTimeoutSeconds:30,runTimeoutSeconds:180,submitTimeoutSeconds:20}),/普通请求30秒.*总时限180秒/);
 assert.match(budgetText(),/暂未取得/);
-console.log("UI contract passed: safe pages, retry progress, manual reconnection and effective network budgets.");
+assert.ok(ids.includes('taskDiagnostics'),'执行结果需要详细诊断区');
+const diagnosticsSource=js.slice(js.indexOf('function diagnosticText(report)'),js.indexOf('async function copyDiagnostic('));
+const diagnosticsApi=new Script(`const modes={submit:'签到'};const labels={error:'执行异常'};${diagnosticsSource};({diagnosticText,diagnosticBundle})`).runInNewContext();
+const report={schema:1,id:'11111111-2222-4333-8444-555555555555',startedAt:1700000000000,finishedAt:1700000060000,mode:'submit',trigger:'manual',attempt:1,maxAttempts:1,batchRound:1,concurrencyLimit:1,result:'error',retryable:true,verificationOnly:false,network:{httpTimeoutMs:60000,runTimeoutMs:300000,submitTimeoutMs:20000},requests:[{startedAt:1700000000000,requestIndex:1,stage:'tenant_list',method:'GET',host:'school.example.edu',outcome:'failed',kind:'timeout',phase:'send',elapsedMs:60000,receivedBytes:0}],truncated:false};
+assert.match(diagnosticsApi.diagnosticText(report),/未取得响应头/);assert.match(diagnosticsApi.diagnosticText(report),/不等同签到成功/);
+const bundle=JSON.parse(diagnosticsApi.diagnosticBundle(Array(12).fill(report)));assert.equal(bundle.tasks.length,10);assert.equal(bundle.omitted,2);assert.equal(bundle.tasks[0].label,'任务1');
+assert.ok(js.includes('navigator.clipboard.writeText(text)')&&js.includes('脱敏诊断文本'),'需支持复制及可选中文本回退');
+console.log("UI contract passed: safe pages, execution traces, private-free copy, retries and network budgets.");
