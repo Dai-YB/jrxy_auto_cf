@@ -44,4 +44,16 @@ assert.match(render({...sample,progressState:"waiting_round"}),/等待其他账�
 assert.match(render({...sample,progressState:"reporting"}),/不会重跑签到/);
 assert.match(render({...sample,progressState:"finished",result:{status:"no_task"}}),/不是签到成功/);
 assert.match(render({...sample,progressState:"finished",result:{status:"error"}}),/不代表签到成功/);
-console.log("UI contract passed: safe user/admin pages, authorization management, concurrency and evidence-aware retry progress.");
+const admission=js.slice(js.indexOf("function admissionNotice(result)"),js.indexOf("async function runTask("));
+const admissionContext={};
+const admissionApi=new Script(`const pending=new Map(),nodes=new Map();const $=id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);};let visibleTaskKey='';const persistTasks=()=>{};${admission};({admissionNotice,trackTask,pending})`).runInNewContext(admissionContext);
+assert.match(admissionApi.admissionNotice({ids:['one'],created:0,continued:1,reasons:{}}),/接续原任务1个/);
+assert.match(admissionApi.admissionNotice({ids:['one'],completed:1,reasons:{}}),/不重签/);
+assert.match(admissionApi.admissionNotice({ids:[],total:1,reasons:{busy:1}}),/登录测试、探测等操作占用1个/);
+assert.match(admissionApi.admissionNotice({ids:[],total:0,reasons:{}}),/没有已保存的账号/);
+let first=0,second=0;
+admissionApi.trackTask(['b','a'],'submit','first',()=>first++);
+const pollingTask=admissionApi.pending.get('a,b');
+admissionApi.trackTask(['a','b'],'submit','second',()=>second++);
+assert.equal(admissionApi.pending.size,1);assert.equal(admissionApi.pending.get('a,b'),pollingTask);pollingTask.resolve([]);assert.equal(first,1);assert.equal(second,1);
+console.log("UI contract passed: safe pages, evidence-aware retry progress and manual batch reconnection.");

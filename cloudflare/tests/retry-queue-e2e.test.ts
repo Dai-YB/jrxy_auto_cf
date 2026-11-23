@@ -1,6 +1,6 @@
 import {beforeEach,describe,expect,it,vi} from "vitest";
 import {env} from "cloudflare:workers";
-import {reset,applyD1Migrations,createMessageBatch,createExecutionContext,getQueueResult} from "cloudflare:test";
+import {reset,applyD1Migrations,createMessageBatch,createExecutionContext,getQueueResult,waitOnExecutionContext} from "cloudflare:test";
 import {createPublicKey,publicEncrypt,constants} from "node:crypto";
 import {Buffer} from "node:buffer";
 import worker from "../src/index";
@@ -10,6 +10,7 @@ import {tick} from "../src/scheduler";
 import {updateExecution} from "../src/execution";
 import {PROTOCOL_PRIVATE_KEY} from "../src/engine/constants";
 import type {Env,Job} from "../src/types";
+import {adminHeaders} from "./helpers";
 const bindings=env as unknown as Env&{TEST_MIGRATIONS:any[]};let e:Env,clock:number;
 type Delivery={body:{id:string;deliveryToken?:string};due:number};let outbox:Delivery[];
 beforeEach(async()=>{
@@ -34,17 +35,20 @@ async function drain(batchId?:string){
   }
   throw new Error("durable queue did not settle within the test budget");
 }
-type Scenario="retry"|"lost-signed"|"unsigned"|"unknown"|"throttle";
+type Scenario="retry"|"lost-signed"|"unsigned"|"unknown"|"throttle"|"portal-520";
 function upstream(scenario:Scenario,parallelism=1){
   const starts:string[]=[],submits:string[]=[],notifies:string[]=[],attempts=new Map<string,number>(),signed=new Set<string>();
-  let submitted=false,active=0,peak=0,firstEntrants=0;
+  let submitted=false,active=0,peak=0,firstEntrants=0,portalFailed=false;
   const firstWave=Promise.withResolvers<void>();
   const transport=vi.spyOn(globalThis,"fetch").mockImplementation(async(input,init)=>{
     const url=new URL(String(input)),headers=new Headers(init?.headers);
     if(url.hostname==="sctapi.ftqq.com"){notifies.push(url.pathname);return Response.json({code:0});}
     if(url.pathname==="/v6/config/guest/tenant/list")return Response.json({data:[{id:"mock",name:"队列模拟学校",joinType:"CLOUD"}]});
     if(url.pathname==="/v6/config/guest/tenant/info")return Response.json({data:[{joinType:"CLOUD",ampUrl:"https://mock.campusphere.net/portal"}]});
-    if(url.pathname==="/portal")return new Response(null,{status:302,headers:{location:"https://login.example.edu/iap/login"}});
+    if(url.pathname==="/portal"){
+      if(scenario==="portal-520"&&!portalFailed){portalFailed=true;return new Response("synthetic origin",{status:520});}
+      return new Response(null,{status:302,headers:{location:"https://login.example.edu/iap/login"}});
+    }
     if(url.pathname==="/iap/login")return new Response("IAP login");
     if(url.pathname==="/iap/security/lt")return Response.json({result:{_lt:"lt"}});
     if(url.pathname==="/iap/checkNeedCaptcha")return Response.json({needCaptcha:false});
@@ -138,6 +142,26 @@ describe("real queue consumer with isolated school protocol failures",()=>{
       const starts=mock.starts.length;await consume(delivery);expect(mock.starts).toHaveLength(starts);
     }finally{now.mockRestore();mock.transport.mockRestore();}
   });
+  it("a portal 520 stays pre-submit, reconnects manual progress and succeeds only on the next round",async()=>{
+    await users(["a","b"]);await updateExecution(e,{parallelism:2});e.RETRY_DELAY_SECONDS="300";
+    const headers=await adminHeaders(e),now=vi.spyOn(Date,"now").mockImplementation(()=>clock),mock=upstream("portal-520");
+    try{
+      await schedule();const first=outbox.splice(0);expect(first).toHaveLength(2);
+      await consume(first.find(item=>item.body.id.endsWith(":a"))!);
+      const failed=await e.DB.prepare("SELECT * FROM jobs WHERE account='a'").first<Job>();
+      expect(failed).toMatchObject({status:"pending",attempts:1,checkpoint:null});
+      expect(JSON.parse(failed!.result!)).toMatchObject({status:"error",retryable:true,transientFailure:true,diagnostic:{stage:"portal",kind:"http",httpStatus:520,method:"GET"}});
+      expect(mock.submits).toHaveLength(0);expect(await e.DB.prepare("SELECT round FROM batches").first("round")).toBe(1);
+      await consume(first.find(item=>item.body.id.endsWith(":b"))!);
+      const before=await e.DB.prepare("SELECT round,round_due,concurrency_limit FROM batches").first<any>();expect(before).toMatchObject({round:2,round_due:clock+300000,concurrency_limit:1});
+      const ctx=createExecutionContext(),response=await worker.fetch(new Request("https://manager.example/api/batch-run",{method:"POST",headers,body:'{"mode":"submit"}'}),e,ctx);await waitOnExecutionContext(ctx);
+      expect(response.status).toBe(202);const admission=await response.json() as any;expect(admission).toMatchObject({created:0,continued:1,completed:1,skipped:0});expect(admission.ids).toHaveLength(2);
+      expect(await e.DB.prepare("SELECT round_due FROM batches").first("round_due")).toBe(before.round_due);expect(mock.submits).toEqual(["b"]);
+      clock=before.round_due;await drain();expect(mock.submits).toEqual(["b","a"]);
+      const jobs=(await e.DB.prepare("SELECT account,status,attempts,result FROM jobs ORDER BY account").all<Job>()).results;
+      expect(jobs.map(job=>job.attempts)).toEqual([2,1]);expect(jobs.every(job=>job.status==="done"&&JSON.parse(job.result!).status==="success")).toBe(true);
+    }finally{now.mockRestore();mock.transport.mockRestore();}
+  },15000);
   it("does not retry school rate limits or classify them as success",async()=>{
     await users(["a"]);const now=vi.spyOn(Date,"now").mockImplementation(()=>clock),mock=upstream("throttle");
     try{await schedule();await drain();const job=await e.DB.prepare("SELECT * FROM jobs").first<Job>();expect(job!.attempts).toBe(1);expect(JSON.parse(job!.result!).status).not.toBe("success");expect(mock.submits).toHaveLength(0);}finally{now.mockRestore();mock.transport.mockRestore();}

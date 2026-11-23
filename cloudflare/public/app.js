@@ -228,18 +228,38 @@ async function removeAccount(account) {
   await api("/api/accounts/"+encodeURIComponent(account.name),"DELETE");toast("账号已删除");await refresh();
 }
 function persistTasks() { sessionStorage.setItem(pendingKey,JSON.stringify([...pending.values()].map(({ids,mode})=>({ids,mode,label:(modes[mode]||"任务")+" · "+ids.length+"个账号"})))); }
-function trackTask(ids,mode,label,resolve,reject) {
-  const key=ids.join(",");pending.set(key,{ids,mode,label,resolve,reject});visibleTaskKey=key;persistTasks();
-  $("taskResult").hidden=false;$("taskTitle").textContent=label;$("taskDetail").textContent="正在读取任务进度；已有签到或重试任务会直接接续展示，不重复创建…";
+function admissionNotice(result) {
+  const reasons=result.reasons||{},skips=[];
+  if(reasons.paused)skips.push(`已暂停${reasons.paused}个`);
+  if(reasons.busy)skips.push(`正被登录测试、探测等操作占用${reasons.busy}个`);
+  if(reasons.unavailable)skips.push(`已到期、删除或失效${reasons.unavailable}个`);
+  if(!result.ids?.length)return result.total===0?"没有已保存的账号，请先添加或授权开通。":
+    "本次未新建签到或探测任务："+(skips.join("；")||"账号状态已变化，请刷新后查看")+"。这不代表已经签到成功。";
+  const parts=[];
+  if(result.created)parts.push(`新建${result.created}个`);
+  if(result.continued)parts.push(`接续原任务${result.continued}个`);
+  if(result.completed)parts.push(`本批已确认成功${result.completed}个（不重签）`);
+  if(skips.length)parts.push("跳过："+skips.join("；"));
+  if(result.continued)parts.push("已有签到任务正在执行、保存报告或等待整轮重试；展示原进度，不重复提交、不提前重试。");
+  return parts.join(" · ");
+}
+function trackTask(ids,mode,label,resolve,reject,note="") {
+  const key=[...new Set(ids)].sort().join(","),task=pending.get(key)||{},priorResolve=task.resolve,priorReject=task.reject;
+  Object.assign(task,{ids,mode,label,note:note||task.note||"",
+    resolve:jobs=>{priorResolve?.(jobs);resolve?.(jobs);},reject:error=>{priorReject?.(error);reject?.(error);}});
+  pending.set(key,task);
+  visibleTaskKey=key;persistTasks();
+  $("taskResult").hidden=false;$("taskTitle").textContent=label;$("taskDetail").textContent=(note?note+"\n\n":"")+"正在读取原任务或新任务进度…";
 }
 async function runTask(path,mode,label) {
-  const result=await api(path,"POST",{mode});
-  if(!result.ids?.length){toast("没有可执行的账号，已暂停或忙碌账号会被跳过。");return [];}
-  return new Promise((resolve,reject)=>{trackTask(result.ids,mode,label,resolve,reject);pollJobs();});
+  const result=await api(path,"POST",{mode}),note=admissionNotice(result);
+  if(!result.ids?.length){toast(note);return [];}
+  if(note)toast(note);
+  return new Promise((resolve,reject)=>{trackTask(result.ids,mode,label,resolve,reject,note);pollJobs();});
 }
 async function runAccount(name,mode) {
   const account=accounts.find(item=>item.name===name),label=accountName(name);
-  if(mode==="submit"&&!await confirmAction("确认签到？",`将对「${label}」（${account?.username||name}）执行真实签到。请确认位置及账号配置正确。`,"开始签到"))return;
+  if(mode==="submit"&&!await confirmAction("确认签到？",`将为「${label}」（${account?.username||name}）创建真实签到任务；若已有签到/等待重试任务，只展示原进度，不重复提交。请确认位置及账号配置正确。`,"开始或查看"))return;
   return runTask(`/api/accounts/${encodeURIComponent(name)}/run`,mode,`${modes[mode]} · ${label}`);
 }
 function jobProgress(job) {
@@ -275,7 +295,7 @@ async function pollJobs() {
       const done=jobs.filter(job=>job.status==="done").length;
       if(key===visibleTaskKey) {
         $("taskTitle").textContent=task.label+(done===jobs.length?" · 已结束（请核对结果）":` · 已结束 ${done}/${jobs.length}`);
-        $("taskDetail").textContent=jobs.map(jobProgress).join("\n\n");
+        $("taskDetail").textContent=(task.note?task.note+"\n\n":"")+jobs.map(jobProgress).join("\n\n");
       }
       if(done===jobs.length){pending.delete(key);persistTasks();task.resolve?.(jobs);await Promise.all([loadLogs(),loadAccounts(),loadStatus()]);}
     }
@@ -422,7 +442,7 @@ $("scheduleForm").addEventListener("submit",async event=>{
 });
 for(const id of ["scheduleEnabled","scheduleInput"])$(id).addEventListener("input",()=>scheduleDirty=true);
 for(const [id,mode] of [["batchDry","dry"],["batchSubmit","submit"]])$(id).addEventListener("click",async()=>{
-  if(mode==="submit"&&!await confirmAction("签到全部正常账号？","已暂停账号不会提交。请确认账号和位置配置正确。","开始签到"))return;
+  if(mode==="submit"&&!await confirmAction("签到全部正常账号？","空闲账号新建签到任务；已有签到或等待重试的账号展示原进度，同一未结束批次的成功账号不重签。暂停/到期账号不提交。请确认账号和位置配置正确。","开始或查看"))return;
   $(id).disabled=true;try{await runTask("/api/batch-run",mode,mode==="dry"?"批量探测":"批量签到");}catch(error){showError(error);}finally{renderAccounts();}
 });
 $("clearLogs").addEventListener("click",async()=>{if(!await confirmAction("清空运行日志？","清空后无法在管理台恢复，不影响账号和定时设置。","清空日志",true))return;try{await api("/api/logs/clear","POST",{});await loadLogs();toast("日志已清空");}catch(error){showError(error);}});

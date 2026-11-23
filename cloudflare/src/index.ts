@@ -3,7 +3,7 @@ import { readJson } from "./security";
 import { authorize, signIn, signOut, rateLimit } from "./auth";
 import { deleteAccount, getAccount, listAccounts, publicAccount, saveAccount, saveLog, setPaused, setPriorities } from "./storage";
 import { notifyOption, sendNotify } from "./notify";
-import { dispatch, enqueue, jobView, processJob } from "./jobs";
+import { admitJobs, dispatch, jobView, processJob } from "./jobs";
 import { localTime, scheduleView, tick, updateSchedule } from "./scheduler";
 import { extractDeviceId } from "./engine/device";
 import { settings } from "./config";
@@ -82,19 +82,18 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       }
       const mode = match[2] === "test-login" ? "login" : match[2] === "sign-range" ? "range" : body.mode;
       if (!["dry", "submit", "login", "range"].includes(String(mode))) throw new AppError("不支持的执行模式");
-      const ids = await enqueue(env, [name], mode as Mode);
+      const admission = await admitJobs(env, [name], mode as Mode);
       ctx.waitUntil(dispatch(env));
-      return json({ ids }, 202);
+      return json(admission, 202);
     }
   }
   if (path === "/api/batch-run" && method === "POST") {
     const { mode } = await readJson(request);
     if (mode !== "dry" && mode !== "submit") throw new AppError("仅支持 dry / submit");
-    const names = await env.DB.prepare("SELECT name,paused FROM accounts WHERE deleted=0 AND (authorization_until IS NULL OR authorization_until>?) ORDER BY name").bind(Date.now()).all<{name: string;paused:number}>();
-    const eligible=names.results.filter(account=>mode!=="submit" || !account.paused);
-    const ids = await enqueue(env, eligible.map(n => n.name), mode, "批量");
+    const names = await env.DB.prepare("SELECT name FROM accounts WHERE deleted=0 ORDER BY name").all<{name: string}>();
+    const admission = await admitJobs(env, names.results.map(n => n.name), mode, "批量",true);
     ctx.waitUntil(dispatch(env));
-    return json({ ids, skipped: names.results.length - ids.length }, 202);
+    return json(admission, 202);
   }
   if (path === "/api/jobs" && method === "GET") return json({ jobs: await jobView(env, (url.searchParams.get("ids") ?? "").split(",").filter(Boolean)) });
   if (path === "/api/schedule" && method === "POST") return json({ scheduler: await updateSchedule(env, await readJson(request)) });

@@ -11,40 +11,60 @@ import { expireSlots, ownsSlotSql, releaseSlot, reserveSlot, slotClaim, slotGate
 const earlierWave=(left:string,right:string)=>`(${left}.priority>${right}.priority OR (${left}.priority=${right}.priority AND ${left}.wave_no<${right}.wave_no))`;
 const reportLease=(alias:string,now=Date.now())=>`${alias}.lease_until>${Math.trunc(now)} AND EXISTS(SELECT 1 FROM execution_slots s WHERE s.kind='job' AND s.task_id=${alias}.id AND s.owner=${alias}.owner AND s.lease_until>${Math.trunc(now)})`;
 
-export async function enqueue(env: Env, names: string[], mode: Mode, triggerLabel = "手动"): Promise<string[]> {
+export interface Admission {
+  ids:string[];
+  total:number;
+  created:number;
+  continued:number;
+  completed:number;
+  skipped:number;
+  reasons:{paused:number;busy:number;unavailable:number};
+}
+export async function admitJobs(env:Env,names:string[],mode:Mode,triggerLabel="手动",batchRequest=false):Promise<Admission> {
   requireConfigured(env);
-  if (!names.length) return [];
-  if(names.length===1){
-    await getAccount(env,names[0]);
-    const existing=await env.DB.prepare("SELECT id,mode FROM jobs WHERE account=? AND (status!='done' OR report_pending=1) ORDER BY created_at,sequence_no LIMIT 1")
-      .bind(names[0]).first<{id:string;mode:Mode}>();
-    if(existing){if(existing.mode===mode&&mode==="submit")return [existing.id];throw new AppError("该账号已有待执行任务，请查看任务状态，不能重复执行",409);}
+  names=[...new Set(names)];
+  const result:Admission={ids:[],total:names.length,created:0,continued:0,completed:0,skipped:0,reasons:{paused:0,busy:0,unavailable:0}};
+  if(!names.length)return result;
+  if(!batchRequest&&names.length===1){
+    const {row}=await getAccount(env,names[0]);
+    if(mode==="submit"&&row.paused)throw new AppError("账号已暂停，请恢复后再签到",409);
   }
-  if(mode==="submit" && names.length===1) {
-    const account=await env.DB.prepare("SELECT paused FROM accounts WHERE name=? AND deleted=0").bind(names[0]).first<{paused:number}>();
-    if(account?.paused)throw new AppError("账号已暂停，请恢复后再签到",409);
-  }
-  const now = Date.now();
-  const batchId = crypto.randomUUID();
-  // 一次 INSERT SELECT 建立整批快照，避免账号数量线性消耗免费版每次调用的数据库查询额度。
-  const rows = await env.DB.batch<{id: string}>([
+  const now=Date.now(),batchId=crypto.randomUUID(),input=JSON.stringify(names);
+  const active="(old.status!='done' OR old.report_pending=1)";
+  // 同一未结束批次的成功结果也只接续展示，不能因点击“签到全部”重新提交。
+  const related=`(${active} OR (?='submit' AND old.mode='submit' AND old.status='done' AND json_valid(old.result)
+    AND json_extract(old.result,'$.status') IN('success','already') AND EXISTS(SELECT 1 FROM batches b WHERE b.id=old.batch_id AND b.finished_at IS NULL)))`;
+  const rows=await env.DB.batch([
     env.DB.prepare("INSERT INTO batches(id,trigger,mode,label,created_at,round_due,concurrency_limit) SELECT ?,'manual',?,?,?,?,parallelism FROM execution_settings WHERE id=1")
       .bind(batchId,mode,triggerLabel,now,now),
     env.DB.prepare(`INSERT INTO jobs(id,account,mode,trigger,next_at,created_at,trigger_label,batch_id,sequence_no,account_version,priority,wave_no,checkpoint,target)
       SELECT ? || ':' || a.name,a.name,?,'manual',?,?,?,?,ROW_NUMBER() OVER(ORDER BY a.priority DESC,CAST(n.key AS INTEGER))-1,a.pause_version,a.priority,
         CAST((ROW_NUMBER() OVER(PARTITION BY a.priority ORDER BY CAST(n.key AS INTEGER))-1)/(SELECT concurrency_limit FROM batches WHERE id=?) AS INTEGER),
-        CASE WHEN ?='submit' THEN a.submission_checkpoint END,
-        CASE WHEN ?='submit' THEN a.submission_checkpoint END
-      FROM json_each(?) n JOIN accounts a ON a.name=n.value WHERE a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?) AND (?!='submit' OR a.paused=0) AND NOT EXISTS
-      (SELECT 1 FROM jobs WHERE account=a.name AND (status!='done' OR report_pending=1)) RETURNING id`)
-      .bind(batchId,mode,now,now,triggerLabel,batchId,batchId,mode,mode,JSON.stringify(names),now,mode)
+        CASE WHEN ?='submit' THEN a.submission_checkpoint END,CASE WHEN ?='submit' THEN a.submission_checkpoint END
+      FROM json_each(?) n JOIN accounts a ON a.name=n.value WHERE a.deleted=0 AND (a.authorization_until IS NULL OR a.authorization_until>?) AND (?!='submit' OR a.paused=0)
+        AND NOT EXISTS(SELECT 1 FROM jobs old WHERE old.account=a.name AND ${related})`)
+      .bind(batchId,mode,now,now,triggerLabel,batchId,batchId,mode,mode,input,now,mode,mode),
+    env.DB.prepare(`SELECT a.name,a.deleted,a.paused,a.authorization_until,j.id,j.mode,j.status,j.report_pending,j.batch_id FROM json_each(?) n
+      LEFT JOIN accounts a ON a.name=n.value LEFT JOIN jobs j ON j.id=(SELECT old.id FROM jobs old WHERE old.account=a.name AND ${related}
+        ORDER BY CASE WHEN ${active} THEN 0 ELSE 1 END,CASE WHEN ${active} THEN old.created_at END,old.created_at DESC,old.rowid DESC LIMIT 1)
+      ORDER BY CAST(n.key AS INTEGER)`).bind(input,mode),
+    env.DB.prepare("DELETE FROM batches WHERE id=? AND NOT EXISTS(SELECT 1 FROM jobs WHERE batch_id=?)").bind(batchId,batchId)
   ]);
-  const ids = rows.slice(1).flatMap(row => row.results.map(value => String(value.id)));
-  if (!ids.length) {
-    await env.DB.prepare("DELETE FROM batches WHERE id=?").bind(batchId).run();
-    if (names.length === 1) throw new AppError("账号不存在或已有待执行任务", 409);
+  for(const row of rows[2].results as unknown as Array<{name:string|null;deleted:number;paused:number;authorization_until:number|null;id:string|null;mode:Mode;status:string;report_pending:number;batch_id:string}>){
+    if(!row.name||!accountValid(row,now)){result.reasons.unavailable++;continue;}
+    if(mode==="submit"&&row.paused){result.reasons.paused++;continue;}
+    if(!row.id||row.mode!==mode||(mode!=="submit"&&row.batch_id!==batchId)){result.reasons.busy++;continue;}
+    result.ids.push(row.id);
+    if(row.batch_id===batchId)result.created++;
+    else if(row.status==="done"&&!row.report_pending)result.completed++;
+    else result.continued++;
   }
-  return ids;
+  result.skipped=result.reasons.paused+result.reasons.busy+result.reasons.unavailable;
+  if(!batchRequest&&names.length===1&&!result.ids.length)throw new AppError(result.reasons.paused?"账号已暂停，请恢复后再签到":"该账号已有待执行任务或已失效，请查看任务状态，不能重复执行",409);
+  return result;
+}
+export async function enqueue(env: Env, names: string[], mode: Mode, triggerLabel = "手动"): Promise<string[]> {
+  return (await admitJobs(env,names,mode,triggerLabel,triggerLabel==="批量")).ids;
 }
 
 export async function advanceBatch(env: Env, id: string, now = Date.now()): Promise<void> {
